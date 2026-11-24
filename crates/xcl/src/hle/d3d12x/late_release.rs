@@ -62,7 +62,9 @@ impl Held {
                     self.fences.insert(key, (f, 0));
                 }
                 let (fence, value) = self.fences.get_mut(&key).unwrap();
-                if q.Signal(&*fence, *value + 1).is_err() {
+                let raw_fence = super::real::unwrap_fence(fence.as_raw());
+                let native_fence = ID3D12Fence::from_raw_borrowed(&raw_fence).unwrap_or(fence);
+                if q.Signal(native_fence, *value + 1).is_err() {
                     ok = false;
                     break;
                 }
@@ -143,8 +145,15 @@ pub unsafe fn drain_known(seal_now: bool) {
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
-        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
-        f(res as *mut c_void);
+        let ptr = res as *mut c_void;
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(ptr, 2));
+        let g = super::real::UnadoptGuard::new(ptr);
+        let n = f(ptr);
+        if n == 0 {
+            if let Some(g) = g {
+                g.forget();
+            }
+        }
     }
 }
 

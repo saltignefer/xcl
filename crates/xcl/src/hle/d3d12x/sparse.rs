@@ -665,12 +665,15 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            let pool = self.pools[h as usize].as_ref().expect("a pool tile of a live pool");
+            let _g_res = super::real::UnadoptGuard::new(res.as_raw());
+            let _g_heap = super::real::UnadoptGuard::new(pool.as_raw());
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
                 Some(coords.as_ptr()),
                 Some(regions.as_ptr()),
-                self.pools[h as usize].as_ref().expect("a pool tile of a live pool"),
+                pool,
                 flags.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -703,6 +706,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
+        let _g_res = super::real::UnadoptGuard::new(res.as_raw());
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -1024,7 +1028,11 @@ impl State {
                     let _ = self.rb_list.Reset(&self.rb_alloc, None);
                     open = true;
                 }
-                self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
+                {
+                    let _g_dst = super::real::UnadoptGuard::new(rb.as_raw());
+                    let _g_src = super::real::UnadoptGuard::new(self.windows[wi].1.as_raw());
+                    self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
+                }
                 pending.push((cur, used, chunk));
                 used += chunk;
                 done += chunk;
@@ -1062,7 +1070,11 @@ impl State {
                 let b = self.windows[wi].0;
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(ZERO_BUF).min(to_win_end);
-                list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64);
+                {
+                    let _g_dst = super::real::UnadoptGuard::new(self.windows[wi].1.as_raw());
+                    let _g_src = super::real::UnadoptGuard::new(zero_buf.as_raw());
+                    list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64);
+                }
                 done += chunk;
             }
         }
@@ -1120,7 +1132,11 @@ impl State {
                 let dst_off = (aligned as usize) % STAGING;
                 std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
                 let staging_res = &self.staging.as_ref().unwrap().0;
-                self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
+                {
+                    let _g_dst = super::real::UnadoptGuard::new(self.windows[wi].1.as_raw());
+                    let _g_src = super::real::UnadoptGuard::new(staging_res.as_raw());
+                    self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
+                }
                 self.ring_write = aligned + chunk as u64;
                 done += chunk;
             }

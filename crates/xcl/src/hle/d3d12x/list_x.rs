@@ -2294,7 +2294,11 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let pc_alloc = super::alloc_pool::for_list(spare as usize, alloc, ty.0);
-        let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso);
+        let reset_hr = {
+            let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+            let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
+        };
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
             next_pc = Some(spare);
@@ -2782,7 +2786,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    {
+        let _list_guard = real::UnadoptGuard::new(this);
+        exec(q_raw, 1, one.as_ptr());
+    }
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
@@ -2834,7 +2841,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
     let pc_alloc = super::alloc_pool::for_list(target as usize, alloc, list_type(target).0);
-    let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso);
+    let reset_hr = {
+        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+        let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
+    };
     real::preserve_vtable(target, ext_closed);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
@@ -3246,7 +3257,9 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     if heaps.is_null() || super::console_heap::global_heap().is_none() {
         if !heaps.is_null() {
             let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
-            with_bindings(this, |b| b.heaps = given);
+            with_bindings(this, |b| b.heaps = given.clone());
+            let _guards: Vec<_> = given.iter().filter_map(|&h| real::UnadoptGuard::new(h as *mut c_void)).collect();
+            return f(this, n, heaps);
         }
         return f(this, n, heaps);
     }
@@ -3254,6 +3267,7 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     let raw: Vec<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
     let kept = raw.clone();
     with_bindings(this, |b| b.heaps = kept);
+    let _guards: Vec<_> = raw.iter().filter_map(|&p| real::UnadoptGuard::new(p as *mut c_void)).collect();
     f(this, raw.len() as u32, raw.as_ptr())
 }
 
@@ -3375,7 +3389,11 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let pc_alloc = super::alloc_pool::for_list(this as usize, alloc, ty);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved);
+    let hr = {
+        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+        let _pso_guard = real::UnadoptGuard::new(resolved as *mut c_void);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
+    };
     real::preserve_vtable(this, ext);
     if hr < 0 {
         return hr;

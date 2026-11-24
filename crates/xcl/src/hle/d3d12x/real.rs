@@ -698,9 +698,53 @@ pub(super) unsafe fn readopt(obj: *mut c_void, kind: Kind) {
     *(obj as *mut usize) = class_for(obj, orig, kind);
 }
 
+/// Temporarily restores an adopted object's native vtable for a call into `d3d12core.dll`
+/// (vkd3d-proton asserts `iface->lpVtbl == &d3d12_*_vtbl` on COM interface arguments).
+/// Safe when the same pointer is guarded twice in one call: the second guard sees
+/// `!is_adopted(obj)` and becomes a no-op, while the first restores the extended vtable on drop.
+pub(super) struct UnadoptGuard {
+    obj: *mut c_void,
+    ext: usize,
+}
+
+impl UnadoptGuard {
+    pub(super) unsafe fn new(obj: *mut c_void) -> Option<Self> {
+        if !crate::util::under_wine() || !is_adopted(obj) {
+            return None;
+        }
+        Some(Self::enter(obj))
+    }
+
+    unsafe fn enter(obj: *mut c_void) -> Self {
+        let ext = *(obj as *const usize);
+        let orig = *(ext as *const usize).sub(1);
+        *(obj as *mut usize) = orig;
+        Self { obj, ext }
+    }
+
+    /// Disarm restoration when the underlying COM object has been destroyed (`Release() == 0`).
+    pub(super) fn forget(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for UnadoptGuard {
+    fn drop(&mut self) {
+        unsafe {
+            *(self.obj as *mut usize) = self.ext;
+        }
+    }
+}
+
 /// Give a genuine D3D12 object the extended vtable for `kind`.
 pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if obj.is_null() {
+        return;
+    }
+    // Under Wine/vkd3d-proton, interfaces with no XCL overrides or console slots can keep
+    // their native vtable intact so vkd3d-proton's `iface->lpVtbl == &d3d12_*_vtbl` checks
+    // always pass without per-call unwrapping.
+    if crate::util::under_wine() && matches!(kind, Kind::RootSignature | Kind::CommandSignature | Kind::QueryHeap) {
         return;
     }
     let v = vt(obj) as usize;
@@ -744,10 +788,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         .max()
         .unwrap_or(0);
     let total = (scanned + EXTRA_SLOTS).max(max_console);
-    let mut v: Vec<usize> = Vec::with_capacity(total + 1);
-    v.push(orig);
+    // Allocate the final boxed slice up front so `ext` is fixed before generating any thunks.
+    let mut v: Box<[usize]> = vec![0usize; total + 1].into_boxed_slice();
+    let ext = v.as_ptr() as usize + 8;
+    v[0] = orig;
+    let wrap_self = crate::util::under_wine() && matches!(kind, Kind::Resource | Kind::Heap | Kind::PipelineState | Kind::DescriptorHeap);
     for i in 0..scanned {
-        v.push(*ot.add(i));
+        let f = *ot.add(i);
+        v[1 + i] = if wrap_self && i < public { super::guard::make_unadopt_self(f, ext, orig) } else { f };
     }
     let hook = if kind == Kind::CommandQueue { super::present::on_queue_console_method as usize } else { 0 };
     for i in public..scanned {
@@ -758,7 +806,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     for i in scanned..total {
         let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
-        v.push(addr);
+        v[1 + i] = addr;
     }
     for (method, f) in overrides(kind) {
         if let Some(s) = layout::slot(iface, method) {
@@ -818,8 +866,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + i] = super::guard::make_tracer(v[1 + i], name);
         }
     }
-    let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
-    let ext = leaked.as_ptr() as usize + 8;
+    let _leaked: &'static [usize] = Box::leak(v);
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
     crate::xlog_info!(
         "D3D12.X: {} – {public} PC methods, {} internal slots under the guard, +{EXTRA_SLOTS} stubs ({kind:?}, PC vtable {})",
@@ -1038,6 +1085,7 @@ unsafe extern "system" fn heap_cpu_start_x(this: *mut c_void) -> u64 {
         return p;
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 9));
+    let _g = UnadoptGuard::new(this);
     let mut h = 0u64;
     f(this, &mut h);
     h
@@ -1048,6 +1096,7 @@ unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
         return p;
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 10));
+    let _g = UnadoptGuard::new(this);
     let mut h = 0u64;
     f(this, &mut h);
     h
@@ -1476,7 +1525,10 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         return S_OK;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
-    let hr = f(this, sub, range, data);
+    let hr = {
+        let _g = UnadoptGuard::new(this);
+        f(this, sub, range, data)
+    };
     if hr >= 0 {
         return hr;
     }
@@ -1504,7 +1556,10 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
 unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, dst_box: *const D3D12_BOX, data: *const c_void, row_pitch: u32, depth_pitch: u32) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_BOX, *const c_void, u32, u32) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "WriteToSubresource")));
-    let hr = f(this, sub, dst_box, data, row_pitch, depth_pitch);
+    let hr = {
+        let _g = UnadoptGuard::new(this);
+        f(this, sub, dst_box, data, row_pitch, depth_pitch)
+    };
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static FAILED: AtomicU64 = AtomicU64::new(0);
     let n = CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1541,27 +1596,37 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
         return;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
+    let _g = UnadoptGuard::new(this);
     f(this, sub, range)
 }
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
     // The last reference: kept until the queues are past the work in flight (`late_release`).
     // (Two last-but-one releases at once can miss each other here; the object then goes at
     // once, as before.)
     let mut held = false;
-    let n = if super::late_release::enabled() {
-        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
-        if add(this) == 2 {
-            f(this);
-            held = true;
-            0
+    let n = {
+        let g = UnadoptGuard::new(this);
+        let n = if super::late_release::enabled() {
+            if add(this) == 2 {
+                f(this);
+                held = true;
+                0
+            } else {
+                f(this);
+                f(this)
+            }
         } else {
-            f(this);
             f(this)
+        };
+        if !held && n == 0 {
+            if let Some(g) = g {
+                g.forget();
+            }
         }
-    } else {
-        f(this)
+        n
     };
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
@@ -1597,7 +1662,16 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let n = {
+        let g = UnadoptGuard::new(this);
+        let n = f(this);
+        if n == 0 {
+            if let Some(g) = g {
+                g.forget();
+            }
+        }
+        n
+    };
     if n == 0 {
         forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
@@ -1712,7 +1786,11 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     // a texture has no GPU address on the PC (0) – on the console every resource has one, and
     // titles use a texture's as the CPU's pointer to it (a retail game clears a 256x256 R32F one
     // through it: with 0 it wrote 256 KB at address 0): the title's address it was placed at
-    match f(this) {
+    let va = {
+        let _g = UnadoptGuard::new(this);
+        f(this)
+    };
+    match va {
         0 => {
             let placed = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
             placed.or_else(|| texture_memory(this)).unwrap_or(0) as u64
@@ -1888,7 +1966,16 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
 /// descriptor heap Release (every caller): a console heap's slots go with it
 unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let n = {
+        let g = UnadoptGuard::new(this);
+        let n = f(this);
+        if n == 0 {
+            if let Some(g) = g {
+                g.forget();
+            }
+        }
+        n
+    };
     if n == 0 {
         super::console_heap::unregister(this as usize);
     }
@@ -1907,6 +1994,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
+    let _g = UnadoptGuard::new(res);
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
 }
 
@@ -1989,7 +2077,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         copy = Some(v);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
+    let Some(slot) = super::console_heap::slot(cpu) else {
+        let _g = UnadoptGuard::new(res);
+        return f(this, res, desc, cpu);
+    };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
@@ -2010,7 +2101,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
-    f(this, res, desc, slot.pc_srv);
+    {
+        let _g = UnadoptGuard::new(res);
+        f(this, res, desc, slot.pc_srv);
+    }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
@@ -2193,6 +2287,8 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
+            let _g0 = UnadoptGuard::new(res);
+            let _g1 = UnadoptGuard::new(counter);
             f(this, res, counter, desc, at)
         }
     };
@@ -2392,6 +2488,9 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateDescriptorHeap", dev_create_descriptor_heap as usize),
             ("CreateRootSignature", dev_create_root_signature as usize),
             ("CreateRenderTargetView", dev_create_rtv as usize),
+            ("CreateShaderResourceView", dev_create_srv_pc as usize),
+            ("CreateUnorderedAccessView", dev_create_uav_pc as usize),
+            ("CreateDepthStencilView", dev_create_dsv_pc as usize),
             ("CreateCommittedResource", dev_create_committed_resource as usize),
             ("CreateHeap", dev_create_heap as usize),
             ("CreatePlacedResource", dev_create_placed_resource as usize),
@@ -2417,7 +2516,12 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("ClearState", cl_clear_state as usize),
             ("DrawInstanced", cl_draw_instanced as usize),
             ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
+            ("CopyBufferRegion", cl_copy_buffer_region as usize),
+            ("CopyTextureRegion", cl_copy_texture_region as usize),
+            ("CopyResource", cl_copy_resource as usize),
+            ("ResourceBarrier", cl_resource_barrier as usize),
             ("SetPipelineState", cl_set_pipeline_state as usize),
+            ("SetDescriptorHeaps", cl_set_descriptor_heaps as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
@@ -2426,8 +2530,18 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Release", cl_release as usize),
             ("Close", cl_close as usize),
             ("Reset", cl_reset as usize),
+            ("CopyBufferRegion", cl_copy_buffer_region as usize),
+            ("CopyTextureRegion", cl_copy_texture_region as usize),
+            ("CopyResource", cl_copy_resource as usize),
+            ("ResourceBarrier", cl_resource_barrier as usize),
         ]),
-        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandQueue => v.extend_from_slice(&[
+            ("Release", q_release as usize),
+            ("UpdateTileMappings", q_update_tile_mappings as usize),
+            ("ExecuteCommandLists", q_execute_command_lists as usize),
+            ("Signal", q_signal_pc as usize),
+            ("Wait", q_wait_pc as usize),
+        ]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
@@ -2454,7 +2568,10 @@ unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
 
 unsafe extern "system" fn qi_override(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let f: QiFn = std::mem::transmute(orig_fn(this, 0));
-    let hr = f(this, riid, ppv);
+    let hr = {
+        let _g = UnadoptGuard::new(this);
+        f(this, riid, ppv)
+    };
     if hr == E_NOINTERFACE && !riid.is_null() {
         let s = layout::guid_string(&*riid);
         if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
@@ -2508,12 +2625,94 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
-    let hr = f(this, allocator, resolved);
+    let hr = {
+        let _alloc_guard = UnadoptGuard::new(allocator);
+        let _pso_guard = UnadoptGuard::new(resolved);
+        f(this, allocator, resolved)
+    };
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
     }
     hr
+}
+
+unsafe extern "system" fn cl_copy_buffer_region(
+    this: *mut c_void,
+    dst: *mut c_void,
+    dst_off: u64,
+    src: *mut c_void,
+    src_off: u64,
+    num_bytes: u64,
+) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CopyBufferRegion")));
+    let _g0 = UnadoptGuard::new(dst);
+    let _g1 = UnadoptGuard::new(src);
+    f(this, dst, dst_off, src, src_off, num_bytes);
+}
+
+unsafe extern "system" fn cl_copy_texture_region(
+    this: *mut c_void,
+    dst: *const c_void,
+    dst_x: u32,
+    dst_y: u32,
+    dst_z: u32,
+    src: *const c_void,
+    src_box: *const c_void,
+) {
+    type F = unsafe extern "system" fn(*mut c_void, *const c_void, u32, u32, u32, *const c_void, *const c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CopyTextureRegion")));
+    // D3D12_TEXTURE_COPY_LOCATION starts with `pResource: *mut c_void` at offset 0
+    let dst_res = if dst.is_null() { std::ptr::null_mut() } else { *(dst as *const *mut c_void) };
+    let src_res = if src.is_null() { std::ptr::null_mut() } else { *(src as *const *mut c_void) };
+    let _g0 = UnadoptGuard::new(dst_res);
+    let _g1 = UnadoptGuard::new(src_res);
+    f(this, dst, dst_x, dst_y, dst_z, src, src_box);
+}
+
+unsafe extern "system" fn cl_copy_resource(this: *mut c_void, dst: *mut c_void, src: *mut c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CopyResource")));
+    let _g0 = UnadoptGuard::new(dst);
+    let _g1 = UnadoptGuard::new(src);
+    f(this, dst, src);
+}
+
+unsafe extern "system" fn cl_resource_barrier(this: *mut c_void, n: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ResourceBarrier")));
+    let mut guards: Vec<UnadoptGuard> = Vec::new();
+    if crate::util::under_wine() && !barriers.is_null() && n > 0 {
+        for b in std::slice::from_raw_parts(barriers, n as usize) {
+            match b.Type {
+                D3D12_RESOURCE_BARRIER_TYPE_TRANSITION => {
+                    let r: *mut c_void = std::mem::transmute_copy(&b.Anonymous.Transition.pResource);
+                    if let Some(g) = UnadoptGuard::new(r) {
+                        guards.push(g);
+                    }
+                }
+                D3D12_RESOURCE_BARRIER_TYPE_ALIASING => {
+                    let r0: *mut c_void = std::mem::transmute_copy(&b.Anonymous.Aliasing.pResourceBefore);
+                    let r1: *mut c_void = std::mem::transmute_copy(&b.Anonymous.Aliasing.pResourceAfter);
+                    if let Some(g) = UnadoptGuard::new(r0) {
+                        guards.push(g);
+                    }
+                    if let Some(g) = UnadoptGuard::new(r1) {
+                        guards.push(g);
+                    }
+                }
+                D3D12_RESOURCE_BARRIER_TYPE_UAV => {
+                    let r: *mut c_void = std::mem::transmute_copy(&b.Anonymous.UAV.pResource);
+                    if let Some(g) = UnadoptGuard::new(r) {
+                        guards.push(g);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    f(this, n, barriers);
 }
 
 /// The PC size of a CheckFeatureSupport structure.
@@ -2667,7 +2866,12 @@ macro_rules! creator {
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
 creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [a1, a2]);
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
-creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+creator!(dev_create_command_list_inner, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+pub(super) unsafe extern "system" fn dev_create_command_list(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _alloc_guard = UnadoptGuard::new(a3 as *mut c_void);
+    let _pso_guard = UnadoptGuard::new(a4 as *mut c_void);
+    dev_create_command_list_inner(this, a1, a2, a3, a4, riid, ppv)
+}
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
 
 /// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
@@ -2689,6 +2893,8 @@ pub(super) unsafe fn create_raw_pc_command_list(
         type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
         let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
         let f: F = std::mem::transmute(*vt(dev).add(slot));
+        let _alloc_guard = UnadoptGuard::new(alloc as *mut c_void);
+        let _pso_guard = UnadoptGuard::new(init_pso as *mut c_void);
         let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
         if hr >= 0 && !out.is_null() {
             adopt(out, Kind::CommandList);
@@ -2701,7 +2907,11 @@ creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHea
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
 creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
+creator!(dev_create_placed_resource_inner, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
+pub(super) unsafe extern "system" fn dev_create_placed_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _heap_guard = UnadoptGuard::new(a1 as *mut c_void);
+    dev_create_placed_resource_inner(this, a1, a2, a3, a4, a5, riid, ppv)
+}
 
 /// D3D12_RESOURCE_STATES the PC knows (as `list_x::PC_STATES`)
 pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
@@ -2837,7 +3047,11 @@ unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
     f(device, &mut r, 0, 1, d);
     r[0]
 }
-creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
+creator!(dev_create_placed_resource1_inner, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
+unsafe extern "system" fn dev_create_placed_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _heap_guard = UnadoptGuard::new(a1 as *mut c_void);
+    dev_create_placed_resource1_inner(this, a1, a2, a3, a4, a5, riid, ppv)
+}
 creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
 creator!(dev_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
@@ -3006,7 +3220,16 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
 /// ID3D12Heap::Release: its block of unified memory goes with it.
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let n = {
+        let g = UnadoptGuard::new(this);
+        let n = f(this);
+        if n == 0 {
+            if let Some(g) = g {
+                g.forget();
+            }
+        }
+        n
+    };
     if n == 0 {
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
@@ -3021,6 +3244,96 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
+/// Thin COM proxy around `ID3D12Fence1` used under Wine/vkd3d-proton so the underlying
+/// fence's native `lpVtbl` stays intact (`vkd3d-proton` compares `fence->lpVtbl` against
+/// `&d3d12_fence_vtbl` in `CommandQueue::Signal` / `Wait` and on its queue thread).
+#[repr(C)]
+struct FenceProxy {
+    vt: usize,
+    pc: *mut c_void,
+}
+
+fn fence_proxy_vtable() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        const SLOTS: usize = 32;
+        let mut v = vec![0usize; SLOTS];
+        for slot in 0..12 {
+            // mov rcx, [rcx + 8]; mov rax, [rcx]; jmp [rax + slot * 8]
+            let mut c = vec![0x48u8, 0x8B, 0x49, 0x08, 0x48, 0x8B, 0x01, 0xFF, 0xA0];
+            c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
+            let p = crate::stubs::alloc_code(c.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
+                windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    p as *const _,
+                    c.len(),
+                );
+            }
+            v[slot] = p as usize;
+        }
+        v[0] = fence_proxy_qi as usize;
+        v[2] = fence_proxy_release as usize;
+        v[10] = fence_proxy_signal as usize;
+        v[12] = super::fence_x::completed_value_address as usize;
+        for slot in 13..SLOTS {
+            let (addr, _) = stubs::make_stub_info(DLL, &format!("ID3D12Fence1::#{slot} (not on PC)"), 0);
+            v[slot] = addr;
+        }
+        Box::leak(v.into_boxed_slice()).as_ptr() as usize
+    })
+}
+
+unsafe extern "system" fn fence_proxy_qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let pc = (*(this as *const FenceProxy)).pc;
+    let f: QiFn = std::mem::transmute(*vt(pc));
+    let hr = f(pc, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && *ppv == pc {
+        *ppv = this;
+    } else if hr == E_NOINTERFACE && !riid.is_null() {
+        let s = layout::guid_string(&*riid);
+        if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
+            crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interface unknown on the PC (console-only?)");
+        }
+    }
+    hr
+}
+
+unsafe extern "system" fn fence_proxy_release(this: *mut c_void) -> u32 {
+    let pc = (*(this as *const FenceProxy)).pc;
+    let f: RefFn = std::mem::transmute(*vt(pc).add(2));
+    let n = f(pc);
+    if n == 0 {
+        drop(Box::from_raw(this as *mut FenceProxy));
+    }
+    n
+}
+
+unsafe extern "system" fn fence_proxy_signal(this: *mut c_void, value: u64) -> HRESULT {
+    let pc = (*(this as *const FenceProxy)).pc;
+    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(*vt(pc).add(10));
+    let hr = f(pc, value);
+    super::fence_x::note_cpu_signal(this as usize);
+    hr
+}
+
+unsafe fn wrap_fence_proxy(pc: *mut c_void) -> *mut c_void {
+    Box::into_raw(Box::new(FenceProxy { vt: fence_proxy_vtable(), pc })) as *mut c_void
+}
+
+pub(super) unsafe fn unwrap_fence(p: *mut c_void) -> *mut c_void {
+    if crate::util::under_wine() { unwrap_fence_proxy(p) } else { p }
+}
+
+unsafe fn unwrap_fence_proxy(p: *mut c_void) -> *mut c_void {
+    if !p.is_null() && crate::gpu::shader::readable(p as usize, 16) && *(p as *const usize) == fence_proxy_vtable() {
+        (*(p as *const FenceProxy)).pc
+    } else {
+        p
+    }
+}
+
 /// fences created through the device (AddRef'd: they are released at the end only)
 /// (a read-write lock: `is_fence` reads it on every queue call, and `end_title` reads it with
 /// the title's threads suspended – a reader that holds it then blocks no other reader)
@@ -3028,7 +3341,21 @@ static FENCES: std::sync::RwLock<Vec<usize>> = std::sync::RwLock::new(Vec::new()
 
 /// CreateFence: as on the PC; the fence is remembered for `end_title`
 unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flags: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let hr = dev_create_fence_pc(this, value, flags, riid, ppv);
+    let hr = if crate::util::under_wine() {
+        type F = unsafe extern "system" fn(*mut c_void, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+        let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateFence")));
+        let mut hr = f(this, value, flags, riid, ppv);
+        if hr == E_NOINTERFACE {
+            let iid = pc_iid(Kind::Fence);
+            hr = f(this, value, flags, &iid, ppv);
+        }
+        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+            *ppv = wrap_fence_proxy(*ppv);
+        }
+        hr
+    } else {
+        dev_create_fence_pc(this, value, flags, riid, ppv)
+    };
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         let add: RefFn = std::mem::transmute(*vt(*ppv).add(1));
         add(*ppv);
@@ -4735,7 +5062,10 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
-    f(this, res, desc, handle);
+    {
+        let _res_guard = UnadoptGuard::new(res);
+        f(this, res, desc, handle);
+    }
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -4744,6 +5074,28 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
             crate::xlog_info!("frame trace: CreateRenderTargetView {handle:#x} → {res:p} {d:?}");
         }
     }
+}
+
+unsafe extern "system" fn dev_create_srv_pc(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateShaderResourceView")));
+    let _g = UnadoptGuard::new(res);
+    f(this, res, desc, handle);
+}
+
+unsafe extern "system" fn dev_create_uav_pc(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const c_void, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const c_void, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateUnorderedAccessView")));
+    let _g0 = UnadoptGuard::new(res);
+    let _g1 = UnadoptGuard::new(counter);
+    f(this, res, counter, desc, handle);
+}
+
+unsafe extern "system" fn dev_create_dsv_pc(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
+    let _g = UnadoptGuard::new(res);
+    f(this, res, desc, handle);
 }
 
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
@@ -4796,14 +5148,33 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let resolved = super::pso_async::resolve_for_bind(pso as usize) as *mut c_void;
+    {
+        let _g = UnadoptGuard::new(resolved);
+        f(this, resolved);
+    }
     super::list_x::on_set_pipeline_state(this, pso as usize);
+}
+
+unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, heaps: *const *mut c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetDescriptorHeaps")));
+    let _guards: Vec<_> = if !heaps.is_null() && n > 0 {
+        std::slice::from_raw_parts(heaps, n as usize).iter().filter_map(|&h| UnadoptGuard::new(h)).collect()
+    } else {
+        Vec::new()
+    };
+    f(this, n, heaps);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let resolved = super::pso_async::resolve_for_bind(pso as usize) as *mut c_void;
+    {
+        let _g = UnadoptGuard::new(resolved);
+        f(this, resolved);
+    }
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
 }
@@ -4835,6 +5206,9 @@ unsafe extern "system" fn cl_execute_indirect(
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
+    let _g0 = UnadoptGuard::new(sig);
+    let _g1 = UnadoptGuard::new(arg_buf);
+    let _g2 = UnadoptGuard::new(cnt_buf);
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
 }
 
@@ -4967,7 +5341,8 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
             }
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            let hr = f(this, a1, a2);
+            let raw_fence = unwrap_fence(a1 as *mut c_void) as usize;
+            let hr = f(this, raw_fence, a2);
             if hr >= 0 {
                 if older == 14 {
                     super::fence_x::note_queue_signal(a1, a2 as u64);
@@ -5053,6 +5428,42 @@ macro_rules! queue_slots {
 }
 queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
 
+/// command queue UpdateTileMappings: unadopt tiled resource & backing heap for vkd3d-proton
+unsafe extern "system" fn q_update_tile_mappings(
+    this: *mut c_void,
+    resource: *mut c_void,
+    num_regions: u32,
+    coords: *const c_void,
+    sizes: *const c_void,
+    heap: *mut c_void,
+    num_ranges: u32,
+    range_flags: *const c_void,
+    heap_offsets: *const c_void,
+    range_counts: *const c_void,
+    flags: u32,
+) {
+    type F = unsafe extern "system" fn(
+        *mut c_void, *mut c_void, u32, *const c_void, *const c_void,
+        *mut c_void, u32, *const c_void, *const c_void, *const c_void, u32,
+    );
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "UpdateTileMappings")));
+    let _g0 = UnadoptGuard::new(resource);
+    let _g1 = UnadoptGuard::new(heap);
+    f(this, resource, num_regions, coords, sizes, heap, num_ranges, range_flags, heap_offsets, range_counts, flags);
+}
+
+/// command queue #14 Signal (PC callers, e.g. XCL's own drain/present/sparse helpers)
+unsafe extern "system" fn q_signal_pc(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+    f(this, unwrap_fence(fence), value)
+}
+
+/// command queue #15 Wait (PC callers)
+unsafe extern "system" fn q_wait_pc(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Wait")));
+    f(this, unwrap_fence(fence), value)
+}
+
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
 /// nothing left Fortnite's render fences pending: its render thread waited, textures were
@@ -5061,7 +5472,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     const PC_SIGNAL: usize = 14;
     super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
-    let hr = f(this, fence, value);
+    let hr = f(this, unwrap_fence(fence), value);
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
@@ -5099,7 +5510,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        {
+            let _list_guards: Vec<_> = chunk.iter().filter_map(|&l| UnadoptGuard::new(l)).collect();
+            f(this, chunk.len() as u32, chunk.as_ptr());
+        }
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
@@ -5762,6 +6176,76 @@ mod console_format_query_tests {
             let d: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&x).as_ptr() as *const _) };
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod wine_vtable_tests {
+    use super::*;
+
+    #[test]
+    fn unadopt_guard_restores_native_vtable_and_handles_nested_guards() {
+        let orig_vt = [0usize; 4];
+        let ext_buf = [orig_vt.as_ptr() as usize, 0, 0, 0, 0];
+        let ext_vt = unsafe { ext_buf.as_ptr().add(1) as usize };
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext_vt);
+
+        let mut obj = [ext_vt];
+        let raw = obj.as_mut_ptr() as *mut c_void;
+        unsafe {
+            assert!(is_adopted(raw));
+            {
+                let g1 = UnadoptGuard::enter(raw);
+                assert_eq!(obj[0], orig_vt.as_ptr() as usize, "native vtable active inside guard");
+                assert!(!is_adopted(raw), "second guard sees native vtable and is a no-op");
+                assert!(UnadoptGuard::new(raw).is_none());
+                drop(g1);
+            }
+            assert_eq!(obj[0], ext_vt, "extended vtable restored on drop");
+
+            // Disarming on final Release must not touch the object's vtable slot.
+            let g2 = UnadoptGuard::enter(raw);
+            assert_eq!(obj[0], orig_vt.as_ptr() as usize);
+            g2.forget();
+            assert_eq!(obj[0], orig_vt.as_ptr() as usize, "forget leaves slot untouched");
+        }
+        EXTS.lock().unwrap().as_mut().unwrap().remove(&ext_vt);
+    }
+
+    #[test]
+    fn fence_proxy_unwraps_and_frees_on_final_release() {
+        static RELEASED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static SIGNALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        unsafe extern "system" fn fake_release(_this: *mut c_void) -> u32 {
+            let n = RELEASED.fetch_add(1, Ordering::SeqCst);
+            if n == 0 { 1 } else { 0 }
+        }
+        unsafe extern "system" fn fake_signal(_this: *mut c_void, val: u64) -> HRESULT {
+            SIGNALED.store(val, Ordering::SeqCst);
+            S_OK
+        }
+
+        let mut fake_vt = [0usize; 12];
+        fake_vt[2] = fake_release as usize;
+        fake_vt[10] = fake_signal as usize;
+        let mut fake_pc = [fake_vt.as_ptr() as usize];
+        let pc_ptr = fake_pc.as_mut_ptr() as *mut c_void;
+
+        unsafe {
+            let proxy = wrap_fence_proxy(pc_ptr);
+            assert_ne!(proxy, pc_ptr);
+            assert_eq!(unwrap_fence_proxy(proxy), pc_ptr, "proxy unwraps to native PC fence");
+            assert_eq!(unwrap_fence_proxy(pc_ptr), pc_ptr, "native fence passes through unchanged");
+
+            let sig: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(*vt(proxy).add(10));
+            assert_eq!(sig(proxy, 42), S_OK);
+            assert_eq!(SIGNALED.load(Ordering::SeqCst), 42);
+
+            let rel: RefFn = std::mem::transmute(*vt(proxy).add(2));
+            assert_eq!(rel(proxy), 1, "non-final release keeps proxy alive");
+            assert_eq!(rel(proxy), 0, "final release frees proxy");
         }
     }
 }
