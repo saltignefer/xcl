@@ -666,14 +666,16 @@ impl State {
                 i += run as usize;
             }
             let pool = self.pools[h as usize].as_ref().expect("a pool tile of a live pool");
-            let _g_res = super::real::UnadoptGuard::new(res.as_raw());
-            let _g_heap = super::real::UnadoptGuard::new(pool.as_raw());
+            let raw_res = super::real::unwrap_proxy(res.as_raw());
+            let raw_pool = super::real::unwrap_proxy(pool.as_raw());
+            let native_res = ID3D12Resource::from_raw_borrowed(&raw_res).unwrap_or(res);
+            let native_pool = ID3D12Heap::from_raw_borrowed(&raw_pool).unwrap_or(pool);
             self.queue.UpdateTileMappings(
-                res,
+                native_res,
                 coords.len() as u32,
                 Some(coords.as_ptr()),
                 Some(regions.as_ptr()),
-                pool,
+                native_pool,
                 flags.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -706,9 +708,10 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
-        let _g_res = super::real::UnadoptGuard::new(res.as_raw());
+        let raw_res = super::real::unwrap_proxy(res.as_raw());
+        let native_res = ID3D12Resource::from_raw_borrowed(&raw_res).unwrap_or(res);
         self.queue.UpdateTileMappings(
-            res,
+            native_res,
             coords.len() as u32,
             Some(coords.as_ptr()),
             Some(regions.as_ptr()),
@@ -1029,9 +1032,11 @@ impl State {
                     open = true;
                 }
                 {
-                    let _g_dst = super::real::UnadoptGuard::new(rb.as_raw());
-                    let _g_src = super::real::UnadoptGuard::new(self.windows[wi].1.as_raw());
-                    self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
+                    let raw_dst = super::real::unwrap_proxy(rb.as_raw());
+                    let raw_src = super::real::unwrap_proxy(self.windows[wi].1.as_raw());
+                    let native_dst = ID3D12Resource::from_raw_borrowed(&raw_dst).unwrap_or(&rb);
+                    let native_src = ID3D12Resource::from_raw_borrowed(&raw_src).unwrap_or(&self.windows[wi].1);
+                    self.rb_list.CopyBufferRegion(native_dst, used as u64, native_src, (cur - b) as u64, chunk as u64);
                 }
                 pending.push((cur, used, chunk));
                 used += chunk;
@@ -1071,9 +1076,11 @@ impl State {
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(ZERO_BUF).min(to_win_end);
                 {
-                    let _g_dst = super::real::UnadoptGuard::new(self.windows[wi].1.as_raw());
-                    let _g_src = super::real::UnadoptGuard::new(zero_buf.as_raw());
-                    list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64);
+                    let raw_dst = super::real::unwrap_proxy(self.windows[wi].1.as_raw());
+                    let raw_src = super::real::unwrap_proxy(zero_buf.as_raw());
+                    let native_dst = ID3D12Resource::from_raw_borrowed(&raw_dst).unwrap_or(&self.windows[wi].1);
+                    let native_src = ID3D12Resource::from_raw_borrowed(&raw_src).unwrap_or(zero_buf);
+                    list.CopyBufferRegion(native_dst, (cur - b) as u64, native_src, 0, chunk as u64);
                 }
                 done += chunk;
             }
@@ -1133,9 +1140,11 @@ impl State {
                 std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
                 let staging_res = &self.staging.as_ref().unwrap().0;
                 {
-                    let _g_dst = super::real::UnadoptGuard::new(self.windows[wi].1.as_raw());
-                    let _g_src = super::real::UnadoptGuard::new(staging_res.as_raw());
-                    self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
+                    let raw_dst = super::real::unwrap_proxy(self.windows[wi].1.as_raw());
+                    let raw_src = super::real::unwrap_proxy(staging_res.as_raw());
+                    let native_dst = ID3D12Resource::from_raw_borrowed(&raw_dst).unwrap_or(&self.windows[wi].1);
+                    let native_src = ID3D12Resource::from_raw_borrowed(&raw_src).unwrap_or(staging_res);
+                    self.slots[slot_idx].list.CopyBufferRegion(native_dst, (cur - b) as u64, native_src, dst_off as u64, chunk as u64);
                 }
                 self.ring_write = aligned + chunk as u64;
                 done += chunk;

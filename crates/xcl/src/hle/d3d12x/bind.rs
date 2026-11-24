@@ -234,7 +234,8 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
-    let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
+    let (pc_this, pc_fn) = super::real::native_self_and_fn(this, 59);
+    let pc: F = std::mem::transmute(pc_fn);
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -257,7 +258,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        return pc(
+            pc_this,
+            super::real::unwrap_proxy_usize(sig),
+            max,
+            super::real::unwrap_proxy_usize(args),
+            args_off,
+            super::real::unwrap_proxy_usize(count_buf),
+            count_off,
+        );
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -270,7 +279,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            pc(
+                pc_this,
+                super::real::unwrap_proxy_usize(sig),
+                max,
+                super::real::unwrap_proxy_usize(args),
+                args_off,
+                super::real::unwrap_proxy_usize(count_buf),
+                count_off,
+            )
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });

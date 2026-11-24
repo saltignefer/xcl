@@ -318,12 +318,16 @@ impl Pages {
             let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
             let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
             let region = D3D12_TILE_REGION_SIZE { NumTiles: tiles.len() as u32, UseBox: false.into(), ..Default::default() };
+            let raw_res = super::real::unwrap_proxy(res.as_raw());
+            let raw_pool = super::real::unwrap_proxy(self.pools[h as usize].as_raw());
+            let native_res = ID3D12Resource::from_raw_borrowed(&raw_res).unwrap_or(res);
+            let native_pool = ID3D12Heap::from_raw_borrowed(&raw_pool).unwrap_or(&self.pools[h as usize]);
             self.queue.UpdateTileMappings(
-                res,
+                native_res,
                 1,
                 Some(&coord),
                 Some(&region),
-                &self.pools[h as usize],
+                native_pool,
                 ranges.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -341,8 +345,10 @@ impl Pages {
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        let raw_res = super::real::unwrap_proxy(res.as_raw());
+        let native_res = ID3D12Resource::from_raw_borrowed(&raw_res).unwrap_or(res);
         self.queue.UpdateTileMappings(
-            res,
+            native_res,
             1,
             Some(&coord),
             Some(&region),

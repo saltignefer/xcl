@@ -81,28 +81,33 @@ fn once(counter: &AtomicU64, n: u64) -> bool {
 }
 
 /// a PC method of the list (its runtime's own)
-unsafe fn pc<F: Copy>(list: *mut c_void, slot: usize) -> F {
-    transmute_copy(&real::orig_fn(list, slot))
+#[inline]
+unsafe fn pc_call<F: Copy>(list: *mut c_void, slot: usize) -> (*mut c_void, F) {
+    let (native, fn_ptr) = real::native_self_and_fn(list, slot);
+    (native, transmute_copy(&fn_ptr))
 }
 
 unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
-    pc::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE)(list)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE);
+    f(p)
 }
 
 unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+    let raw_res = real::unwrap_proxy_usize(res);
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                pResource: transmute_copy(&res),
+                pResource: transmute_copy(&raw_res),
                 Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 StateBefore: before,
                 StateAfter: after,
             }),
         },
     };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER);
+    f(p, 1, &b);
 }
 
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
@@ -113,7 +118,8 @@ unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
 }
 
 unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION)(list, dst, dst_off, src, src_off, n);
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION);
+    f(p, real::unwrap_proxy_usize(dst), dst_off, real::unwrap_proxy_usize(src), src_off, n);
 }
 
 fn warn(counter: &AtomicU64, what: &str, why: std::fmt::Arguments) {
@@ -457,7 +463,8 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
         b.topology = Some(t);
         b.rect_list = rect;
     });
-    pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY)(this, t)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY);
+    f(p, t)
 }
 
 /// console #21 RSSetViewports (PC #21)
@@ -466,7 +473,8 @@ pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u3
         let vs = std::slice::from_raw_parts(v, n as usize).to_vec();
         with_bindings(this, |b| b.viewports = vs);
     }
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(this, PC_RS_SET_VIEWPORTS)(this, n, v)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(this, PC_RS_SET_VIEWPORTS);
+    f(p, n, v)
 }
 
 /// console #22 RSSetScissorRects (PC #22)
@@ -475,20 +483,23 @@ pub(super) unsafe extern "system" fn rs_set_scissors_x(this: *mut c_void, n: u32
         let rs = std::slice::from_raw_parts(r, n as usize).to_vec();
         with_bindings(this, |b| b.scissors = rs);
     }
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS)(this, n, r)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS);
+    f(p, n, r)
 }
 
 /// console #23 OMSetBlendFactor (PC #23)
 pub(super) unsafe extern "system" fn om_set_blend_factor_x(this: *mut c_void, f: *const [f32; 4]) {
     let v = f.as_ref().copied();
     with_bindings(this, |b| b.blend = v);
-    pc::<unsafe extern "system" fn(*mut c_void, *const [f32; 4])>(this, PC_OM_SET_BLEND_FACTOR)(this, f)
+    let (p, g) = pc_call::<unsafe extern "system" fn(*mut c_void, *const [f32; 4])>(this, PC_OM_SET_BLEND_FACTOR);
+    g(p, f)
 }
 
 /// console #24 OMSetStencilRef (PC #24)
 pub(super) unsafe extern "system" fn om_set_stencil_ref_x(this: *mut c_void, r: u32) {
     with_bindings(this, |b| b.stencil = Some(r));
-    pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF)(this, r)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF);
+    f(p, r)
 }
 
 /// OMSetRenderTargets as the PC list got it (`real::cl_om_set_render_targets`)
@@ -508,34 +519,41 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
         return;
     }
     if !b.heaps.is_empty() {
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, b.heaps.len() as u32, b.heaps.as_ptr());
+        set_descriptor_heaps_native(this, &b.heaps);
     }
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT {
         return;
     }
     if let Some(t) = b.topology {
-        pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY)(this, t);
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY);
+        f(p, t);
     }
     if !b.viewports.is_empty() {
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(this, PC_RS_SET_VIEWPORTS)(this, b.viewports.len() as u32, b.viewports.as_ptr());
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(this, PC_RS_SET_VIEWPORTS);
+        f(p, b.viewports.len() as u32, b.viewports.as_ptr());
     }
     if !b.scissors.is_empty() {
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS)(this, b.scissors.len() as u32, b.scissors.as_ptr());
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS);
+        f(p, b.scissors.len() as u32, b.scissors.as_ptr());
     }
-    if let Some(f) = b.blend {
-        pc::<unsafe extern "system" fn(*mut c_void, *const [f32; 4])>(this, PC_OM_SET_BLEND_FACTOR)(this, &f);
+    if let Some(fval) = b.blend {
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, *const [f32; 4])>(this, PC_OM_SET_BLEND_FACTOR);
+        f(p, &fval);
     }
     if let Some(r) = b.stencil {
-        pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF)(this, r);
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF);
+        f(p, r);
     }
     for (&slot, v) in &b.vertex_buffers {
-        pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS)(this, slot, 1, v);
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
+        f(p, slot, 1, v);
     }
     if let Some(rt) = &b.render_targets {
         let d = rt.dsv.unwrap_or(0);
         let (n, rts_ptr) = if rt.handles.is_empty() { (0, std::ptr::null()) } else { (rt.num_targets, rt.handles.as_ptr()) };
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize)>(this, PC_OM_SET_RENDER_TARGETS)(
-            this,
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize)>(this, PC_OM_SET_RENDER_TARGETS);
+        f(
+            p,
             n,
             rts_ptr,
             rt.single,
@@ -1121,14 +1139,34 @@ unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
     completed
 }
 
+/// Remove a released title fence from `SYNC_GRAPH` so future cycle checks never dereference
+/// a freed fence or inherit stale edges if its address is reused.
+pub(super) fn forget_title_fence(fence: usize) {
+    if fence == 0 {
+        return;
+    }
+    let mut g = SYNC_GRAPH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(graph) = g.as_mut() {
+        graph.title_fences.remove(&fence);
+    }
+}
+
 /// Prune completed waits/signals from a tracked title `ID3D12Fence`.
-unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
+/// Cloned `ID3D12Fence` handles are pushed onto `defer_drop` so the caller drops them AFTER
+/// releasing `SYNC_GRAPH` (dropping the last ref to a `ComProxy(Fence)` calls
+/// `forget_title_fence`, which locks `SYNC_GRAPH`).
+unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync, defer_drop: &mut Vec<ID3D12Fence>) {
     if tf.waits.is_empty() && tf.signals.is_empty() {
         return;
     }
     let p = fence_raw as *mut c_void;
-    let Some(f) = ID3D12Fence::from_raw_borrowed(&p) else { return };
+    let Some(f) = real::try_clone_fence(p) else {
+        tf.waits.clear();
+        tf.signals.clear();
+        return;
+    };
     let completed = f.GetCompletedValue();
+    defer_drop.push(f);
     if completed == u64::MAX {
         tf.waits.clear();
         tf.signals.clear();
@@ -1148,7 +1186,13 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
 /// involving title `ID3D12Fence` waits/signals) before any cyclic wait-signal pair reaches Vulkan.
 ///
 /// Returns `true` iff emitting `sig_q.Signal` for `(target_va, sig_val)` would close a cycle.
-unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_va: u64, sig_val: u64) -> bool {
+unsafe fn would_signal_close_cycle(
+    graph: &mut SyncGraph,
+    sig_q: usize,
+    target_va: u64,
+    sig_val: u64,
+    defer_drop: &mut Vec<ID3D12Fence>,
+) -> bool {
     // Prune completed waits/signals on target cell first.
     let target_waiters: Vec<(usize, u64)> = {
         let Some(target) = graph.cells.get_mut(&target_va) else { return false };
@@ -1185,7 +1229,7 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         }
     }
     for (&tf_raw, tf) in graph.title_fences.iter_mut() {
-        prune_title_fence(tf_raw, tf);
+        prune_title_fence(tf_raw, tf, defer_drop);
         for &(val, wq, wseq) in &tf.waits {
             if let Some(s) = tf.signals.iter().find(|s| s.val >= val) {
                 edges.push((wq, wseq, s.queue, s.seq));
@@ -1229,12 +1273,16 @@ pub(super) unsafe fn note_title_queue_wait(queue: usize, fence: usize, value: u6
     if once(&LOGGED, 8) {
         crate::xlog_info!("D3D12.X: title ID3D12CommandQueue::Wait on q{} fence {fence:#x} >= {value:#x}", queue_id(queue));
     }
-    let mut g = SYNC_GRAPH.lock().unwrap();
-    let graph = g.get_or_insert_with(SyncGraph::default);
-    let seq = graph.next_seq(queue);
-    let tf = graph.title_fences.entry(fence).or_default();
-    prune_title_fence(fence, tf);
-    tf.waits.push((value, queue, seq));
+    let mut defer_drop: Vec<ID3D12Fence> = Vec::new();
+    {
+        let mut g = SYNC_GRAPH.lock().unwrap();
+        let graph = g.get_or_insert_with(SyncGraph::default);
+        let seq = graph.next_seq(queue);
+        let tf = graph.title_fences.entry(fence).or_default();
+        prune_title_fence(fence, tf, &mut defer_drop);
+        tf.waits.push((value, queue, seq));
+    }
+    drop(defer_drop);
 }
 
 /// Record a title `ID3D12CommandQueue::Signal(fence, value)` in the exact sync graph.
@@ -1242,12 +1290,16 @@ pub(super) unsafe fn note_title_queue_signal(queue: usize, fence: usize, value: 
     if queue == 0 || fence == 0 || value == 0 {
         return;
     }
-    let mut g = SYNC_GRAPH.lock().unwrap();
-    let graph = g.get_or_insert_with(SyncGraph::default);
-    let seq = graph.next_seq(queue);
-    let tf = graph.title_fences.entry(fence).or_default();
-    prune_title_fence(fence, tf);
-    tf.signals.push(SubmittedSignal { val: value, queue, seq });
+    let mut defer_drop: Vec<ID3D12Fence> = Vec::new();
+    {
+        let mut g = SYNC_GRAPH.lock().unwrap();
+        let graph = g.get_or_insert_with(SyncGraph::default);
+        let seq = graph.next_seq(queue);
+        let tf = graph.title_fences.entry(fence).or_default();
+        prune_title_fence(fence, tf, &mut defer_drop);
+        tf.signals.push(SubmittedSignal { val: value, queue, seq });
+    }
+    drop(defer_drop);
 }
 
 /// Before a title `ID3D12CommandQueue::Signal(title_fence, value)` is submitted, check if it would
@@ -1257,13 +1309,16 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     if sig_q == 0 || title_fence == 0 || sig_val == 0 {
         return;
     }
+    let mut defer_drop: Vec<ID3D12Fence> = Vec::new();
     let to_release: Vec<(u64, u64, ID3D12Fence)> = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
-        prune_title_fence(title_fence, tf);
+        prune_title_fence(title_fence, tf, &mut defer_drop);
         let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
         if target_waiters.is_empty() {
+            drop(g);
+            drop(defer_drop);
             return;
         }
         // Build edges tagging whether each edge is a Wait64 SyncCell `(Some((va, aw_val)))` or title fence (`None`).
@@ -1286,7 +1341,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
             if tf_raw == title_fence {
                 continue;
             }
-            prune_title_fence(tf_raw, other_tf);
+            prune_title_fence(tf_raw, other_tf, &mut defer_drop);
             for &(val, wq, wseq) in &other_tf.waits {
                 if let Some(s) = other_tf.signals.iter().find(|s| s.val >= val) {
                     edges.push((wq, wseq, s.queue, s.seq, None));
@@ -1337,6 +1392,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         }
         out
     };
+    drop(defer_drop);
     for (va, val, fence) in to_release {
         let _ = fence.Signal(val);
         static MIXED_WARN: AtomicU64 = AtomicU64::new(0);
@@ -1499,7 +1555,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         s.push_write64_signal(va, value);
         (s.list_type, s.last_queue)
     };
-    let rescue: Option<(ID3D12Fence, u64, u64)> = {
+    let (dropped_fence, rescue): (Option<ID3D12Fence>, Option<(ID3D12Fence, u64, u64)>) = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
         if cell.non_monotonic {
@@ -1518,7 +1574,12 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
             cell.non_monotonic = true;
             let prev_sub = cell.submitted_max;
             let old_fence = cell.fence.take();
-            old_fence.filter(|_| max_armed > 0).map(|f| (f, max_armed, prev_sub))
+            if max_armed > 0 {
+                (None, old_fence.map(|f| (f, max_armed, prev_sub)))
+            } else {
+                // Defer dropping `old_fence` until after `SYNC_GRAPH` unlocks.
+                (old_fence, None)
+            }
         } else {
             if value > cell.recorded_max {
                 cell.recorded_max = value;
@@ -1529,9 +1590,10 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
                     cell.recorded_last_queue = last_q;
                 }
             }
-            None
+            (None, None)
         }
     };
+    drop(dropped_fence);
     // Rescue any armed GPU waits BEFORE dropping the fence so no vkd3d_queue thread can be orphaned.
     if let Some((old_fence, max_armed, prev_sub)) = rescue {
         unsafe {
@@ -1581,6 +1643,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
             GpuSignal,
             CpuCycleBreak(Vec<(usize, bool)>),
         }
+        let mut defer_drop: Vec<ID3D12Fence> = Vec::new();
         let action = {
             let mut g = SYNC_GRAPH.lock().unwrap();
             let graph = g.get_or_insert_with(SyncGraph::default);
@@ -1598,7 +1661,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
             match eligible {
                 None => SignalAction::Skip,
                 Some(completed) => {
-                    if would_signal_close_cycle(graph, sig_q, va, val) {
+                    if would_signal_close_cycle(graph, sig_q, va, val, &mut defer_drop) {
                         let cell = graph.cells.get_mut(&va).unwrap();
                         let waiters: Vec<(usize, bool)> =
                             cell.armed_waits.iter().filter(|aw| aw.val <= val).map(|aw| (aw.waiting_queue, aw.after_write64)).collect();
@@ -1634,6 +1697,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
         };
+        drop(defer_drop);
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
@@ -2089,7 +2153,10 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
-    as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
+    as_copy_dest(list, d, || {
+        let (p, f) = pc_call::<F>(list, PC_WRITE_BUFFER_IMMEDIATE);
+        f(p, params.len() as u32, params.as_ptr(), modes.as_ptr());
+    });
 }
 
 /// timestamp queries (one heap per device, used round-robin) and a lazily created READBACK
@@ -2179,8 +2246,12 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     if let Some((d, off)) = uma_dst {
         note_write(list as usize, va, 8);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
-        as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+        let (p, end_q) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY);
+        end_q(p, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+        as_copy_dest(list, d, || {
+            let (p, res_q) = pc_call::<Resolve>(list, PC_RESOLVE_QUERY_DATA);
+            res_q(p, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, real::unwrap_proxy_usize(d), off);
+        });
     } else if let Some((rb, base)) = readback {
         // Queue the CPU copy only if the list is tracked; otherwise avoid emitting an unused resolve.
         let mut g = LISTS.lock().unwrap();
@@ -2191,8 +2262,10 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         let off = i as u64 * 8;
         s.cpu_writes.push(super::cpu_writes::Write::ReadbackU64 { va: va as usize, src: base + off as usize, _buf: rb });
         drop(g);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
-        pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off);
+        let (p, end_q) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY);
+        end_q(p, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+        let (p, res_q) = pc_call::<Resolve>(list, PC_RESOLVE_QUERY_DATA);
+        res_q(p, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, real::unwrap_proxy_usize(rb_raw), off);
     }
 }
 
@@ -2265,7 +2338,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     };
 
     if let Some(((h, i), qty)) = active_query {
-        pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
+        let (p, end_q) = pc_call::<QueryFn>(list, PC_END_QUERY);
+        end_q(p, h, qty, i);
     }
     if pred_in_state {
         if let Some(ref pb) = pred_buf {
@@ -2274,7 +2348,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     }
 
     let ext = *(list as *const usize);
-    let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
+    let (p_close, close_f) = pc_call::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE);
+    let close_hr = close_f(p_close);
     real::preserve_vtable(list, ext);
     if close_hr < 0 {
         static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
@@ -2294,11 +2369,12 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let pc_alloc = super::alloc_pool::for_list(spare as usize, alloc, ty.0);
-        let reset_hr = {
-            let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
-            let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
-            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
-        };
+        let (p_sp, reset_f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET);
+        let reset_hr = reset_f(
+            p_sp,
+            real::unwrap_proxy_usize(pc_alloc),
+            real::unwrap_proxy_usize(init_pso),
+        );
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
             next_pc = Some(spare);
@@ -2393,14 +2469,16 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             set_index_buffer(next_pc, Some(view));
         }
         if let Some((min, max)) = depth_bounds {
-            pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(next_pc, PC_OM_SET_DEPTH_BOUNDS)(next_pc, min, max);
+            let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, f32, f32)>(next_pc, PC_OM_SET_DEPTH_BOUNDS);
+            f(p, min, max);
         }
     }
     if ty != D3D12_COMMAND_LIST_TYPE_COPY {
         if let (Some(op), Some(ref pb)) = (predication, pred_buf) {
             let pb_raw = pb.as_raw() as usize;
             transition(next_pc, pb_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
-            pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(next_pc, PC_SET_PREDICATION)(next_pc, pb_raw, 0, op);
+            let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(next_pc, PC_SET_PREDICATION);
+            f(p, real::unwrap_proxy_usize(pb_raw), 0, op);
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                 s.pred_in_state = true;
             }
@@ -2501,7 +2579,8 @@ pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_voi
 /// command list #68 OMSetDepthBounds(min, max) (PC #62)
 pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: f32, max: f32) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_bounds = Some((min, max));
-    pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS)(this, min, max);
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS);
+    f(p, min, max);
 }
 
 /// command list #78 DispatchX(x, y, z, flags)
@@ -2519,7 +2598,8 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
             UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }),
         },
     };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER);
+    f(p, 1, &b);
 }
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
@@ -2611,7 +2691,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
 /// bind `SetPredication(pb, 0, op)` on `this`.
 unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
-    let f = pc::<F>(this, PC_SET_PREDICATION);
+    let (p_pred, f) = pc_call::<F>(this, PC_SET_PREDICATION);
     let (was_active, was_in_state) = LISTS
         .lock()
         .unwrap()
@@ -2621,7 +2701,7 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
     // Disarm any active predicate before copying the new predicate value so a failing predicate
     // does not suppress `CopyBufferRegion` when switching directly between buffers.
     if was_active {
-        f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        f(p_pred, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
     }
     transition(this, uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     let pb_before = if was_in_state { D3D12_RESOURCE_STATE_PREDICATION } else { D3D12_RESOURCE_STATE_COMMON };
@@ -2629,7 +2709,7 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
     copy_buffer_region(this, pb, 0, uma_buf, off, 8);
     transition(this, uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(this, pb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
-    f(this, pb, 0, op);
+    f(p_pred, real::unwrap_proxy_usize(pb), 0, op);
     PREDICATION_USED.store(true, Ordering::Release);
     if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
         s.predication = Some(op);
@@ -2650,8 +2730,8 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
     }
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
     if desc.is_null() {
-        let f = pc::<F>(this, PC_SET_PREDICATION);
-        f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        let (p_pred, f) = pc_call::<F>(this, PC_SET_PREDICATION);
+        f(p_pred, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         let pb = {
             let mut g = LISTS.lock().unwrap();
             g.as_mut().and_then(|m| m.get_mut(&(this as usize))).and_then(|s| {
@@ -2742,7 +2822,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
-        pc::<QueryFn>(this, PC_END_QUERY)(this, h, qty, i);
+        let (p, end_q) = pc_call::<QueryFn>(this, PC_END_QUERY);
+        end_q(p, h, qty, i);
     }
     if pred_in_state {
         if let Some(pb) = pred_buf {
@@ -2751,7 +2832,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let ext = *(this as *const usize);
-    let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
+    let (p_close, close_f) = pc_call::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE);
+    let close_hr = close_f(p_close);
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
@@ -2768,7 +2850,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
-                exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                if real::proxies_active() {
+                    let native: Vec<*mut c_void> = chunk.iter().map(|&l| real::unwrap_proxy(l)).collect();
+                    exec(q_raw, native.len() as u32, native.as_ptr());
+                } else {
+                    exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                }
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
@@ -2786,10 +2873,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    {
-        let _list_guard = real::UnadoptGuard::new(this);
-        exec(q_raw, 1, one.as_ptr());
-    }
+    let one_native = [real::unwrap_proxy(this)];
+    exec(q_raw, 1, one_native.as_ptr());
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
@@ -2841,11 +2926,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
     let pc_alloc = super::alloc_pool::for_list(target as usize, alloc, list_type(target).0);
-    let reset_hr = {
-        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
-        let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
-    };
+    let (p_rst, reset_f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET);
+    let reset_hr = reset_f(
+        p_rst,
+        real::unwrap_proxy_usize(pc_alloc),
+        real::unwrap_proxy_usize(init_pso),
+    );
     real::preserve_vtable(target, ext_closed);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
@@ -2894,12 +2980,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             set_index_buffer(target, Some(view));
         }
         if let Some((min, max)) = depth_bounds {
-            pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(target, PC_OM_SET_DEPTH_BOUNDS)(target, min, max);
+            let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, f32, f32)>(target, PC_OM_SET_DEPTH_BOUNDS);
+            f(p, min, max);
         }
     }
     if let (Some(op), Some(pb)) = (predication, pred_buf) {
         transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION);
+        f(p, real::unwrap_proxy_usize(pb), 0, op);
         if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
             s.pred_in_state = true;
         }
@@ -2953,7 +3041,8 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         };
         if let Some(base) = need_restore_base {
             let resolved = super::pso_async::resolve_for_bind(base);
-            pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+            let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE);
+            f(p, real::unwrap_proxy_usize(resolved));
         }
         if !need_native_call {
             return;
@@ -2997,7 +3086,8 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     };
     if let Some(base) = restore {
         let resolved = super::pso_async::resolve_for_bind(base);
-        pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE);
+        f(p, real::unwrap_proxy_usize(resolved));
     }
 }
 
@@ -3037,7 +3127,8 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
         None => (bound_pso, false),
     };
     let resolved = super::pso_async::resolve_for_bind(target);
-    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE);
+    f(p, real::unwrap_proxy_usize(resolved));
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
@@ -3218,8 +3309,8 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
 }
 
 unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
-    let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
-    f(list, view.map_or(std::ptr::null(), |v| v as *const _));
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
+    f(p, view.map_or(std::ptr::null(), |v| v as *const _));
 }
 
 /// The heaps a list binds for console code: a view heap in the shared shader-visible heap
@@ -3250,25 +3341,44 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
     out
 }
 
+/// Forward `SetDescriptorHeaps` to native PC slot #28 with any `ComProxy` pointers unwrapped,
+/// passing the caller's slice directly when no proxies are active (zero-copy on native Windows)
+/// and avoiding heap allocation for the common `n <= 2` case under Wine.
+unsafe fn set_descriptor_heaps_native(this: *mut c_void, heaps: &[usize]) {
+    const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    if !real::proxies_active() {
+        f(p, heaps.len() as u32, heaps.as_ptr());
+        return;
+    }
+    if heaps.len() <= 2 {
+        let mut buf = [0usize; 2];
+        for (dst, &h) in buf.iter_mut().zip(heaps) {
+            *dst = real::unwrap_proxy_usize(h);
+        }
+        f(p, heaps.len() as u32, buf.as_ptr());
+    } else {
+        let buf: Vec<usize> = heaps.iter().map(|&h| real::unwrap_proxy_usize(h)).collect();
+        f(p, buf.len() as u32, buf.as_ptr());
+    }
+}
+
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
-    let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
     if heaps.is_null() || super::console_heap::global_heap().is_none() {
         if !heaps.is_null() {
-            let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
-            with_bindings(this, |b| b.heaps = given.clone());
-            let _guards: Vec<_> = given.iter().filter_map(|&h| real::UnadoptGuard::new(h as *mut c_void)).collect();
-            return f(this, n, heaps);
+            let slice = std::slice::from_raw_parts(heaps, n as usize);
+            with_bindings(this, |b| b.heaps = slice.to_vec());
+            return set_descriptor_heaps_native(this, slice);
         }
-        return f(this, n, heaps);
+        return f(p, n, heaps);
     }
     let h = pc_heaps(n, heaps);
     let raw: Vec<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
-    let kept = raw.clone();
-    with_bindings(this, |b| b.heaps = kept);
-    let _guards: Vec<_> = raw.iter().filter_map(|&p| real::UnadoptGuard::new(p as *mut c_void)).collect();
-    f(this, raw.len() as u32, raw.as_ptr())
+    with_bindings(this, |b| b.heaps = raw.clone());
+    set_descriptor_heaps_native(this, &raw);
 }
 
 const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
@@ -3276,9 +3386,9 @@ const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
 /// command list #48 IASetVertexBuffers(start slot, count, views) (PC #44): the addresses are
 /// the title's (its memory: the GPU address of that memory for the PC)
 pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, start: u32, n: u32, views: *const D3D12_VERTEX_BUFFER_VIEW) {
-    let f = pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
     if views.is_null() || n == 0 {
-        return f(this, start, n, views);
+        return f(p, start, n, views);
     }
     let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = (0..n as usize)
         .map(|k| {
@@ -3316,7 +3426,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
             b.vertex_titles.insert(start + k as u32, titles[k]);
         }
     });
-    f(this, start, n, v.as_ptr())
+    f(p, start, n, v.as_ptr())
 }
 
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
@@ -3389,11 +3499,12 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let pc_alloc = super::alloc_pool::for_list(this as usize, alloc, ty);
-    let hr = {
-        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
-        let _pso_guard = real::UnadoptGuard::new(resolved as *mut c_void);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
-    };
+    let (p_rst, reset_f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET);
+    let hr = reset_f(
+        p_rst,
+        real::unwrap_proxy_usize(pc_alloc),
+        real::unwrap_proxy_usize(resolved),
+    );
     real::preserve_vtable(this, ext);
     if hr < 0 {
         return hr;
@@ -3521,7 +3632,27 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+        // Unwrap any Wine ComProxy resource pointers right before crossing into native D3D12.
+        if real::proxies_active() {
+            for b in &mut out {
+                let unwrap_words = |words: &mut [u32]| {
+                    let r = (words[0] as u64 | (words[1] as u64) << 32) as usize;
+                    let u = real::unwrap_proxy_usize(r) as u64;
+                    words[0] = u as u32;
+                    words[1] = (u >> 32) as u32;
+                };
+                match b[0] {
+                    0 | 2 => unwrap_words(&mut b[2..4]),
+                    1 => {
+                        unwrap_words(&mut b[2..4]);
+                        unwrap_words(&mut b[4..6]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER);
+        f(p, out.len() as u32, out.as_ptr());
     }
 }
 
@@ -3540,10 +3671,12 @@ unsafe fn is_buffer(res: usize) -> bool {
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let ext = *(this as *const usize);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
+    let (p, close_f) = pc_call::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9);
+    let hr = close_f(p);
     real::preserve_vtable(this, ext);
     if hr < 0 {
-        let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
+        let (pt, ty_f) = pc_call::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE);
+        let ty = ty_f(pt);
         crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);
     }
     hr
@@ -3582,7 +3715,15 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION);
+    f(
+        p,
+        real::unwrap_proxy_usize(dst),
+        dst_off + real::buffer_delta(dst),
+        real::unwrap_proxy_usize(src),
+        src_off + real::buffer_delta(src),
+        n,
+    )
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
@@ -3681,8 +3822,15 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
             }
         }
     }
-    let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
-    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    let (Some(mut d), Some(mut s)) = (pc_location(dst), pc_location(src)) else { return };
+    if real::proxies_active() {
+        let dr = real::unwrap_proxy(transmute_copy(&d.pResource));
+        let sr = real::unwrap_proxy(transmute_copy(&s.pResource));
+        std::ptr::write(&mut d.pResource, transmute_copy(&dr));
+        std::ptr::write(&mut s.pResource, transmute_copy(&sr));
+    }
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION);
+    f(p, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
 }
 
@@ -3708,7 +3856,8 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW);
+    f(p, dsv, flags, depth, stencil, n, rects)
 }
 
 const PC_RESOLVE_SUBRESOURCE: usize = 19;
@@ -3743,7 +3892,8 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE);
+    f(p, real::unwrap_proxy_usize(dst), dst_sub, real::unwrap_proxy_usize(src), src_sub, format)
 }
 
 /// command list #108 ResolveSubresourceRegion(dst, dst sub, x, y, src, src sub, rect, format,
@@ -3754,7 +3904,8 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
+    let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION);
+    f(p, real::unwrap_proxy_usize(dst), dst_sub, x, y, real::unwrap_proxy_usize(src), src_sub, rect, format, mode)
 }
 
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
@@ -3767,7 +3918,8 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        let (p, f) = pc_call::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE);
+        return f(p, real::unwrap_proxy_usize(dst), real::unwrap_proxy_usize(src));
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);
@@ -3789,13 +3941,15 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
             if once(&N, 1) {
                 crate::xlog_info!("D3D12.X: nested occlusion query – the outer one ends there and reports visible, the inner one counts");
             }
-            pc::<QueryFn>(this, PC_END_QUERY)(this, h, oty, i);
+            let (p, end_q) = pc_call::<QueryFn>(this, PC_END_QUERY);
+            end_q(p, h, oty, i);
         }
         if let Some(m) = VISIBLE.lock().unwrap().as_mut() {
             m.remove(&(heap, index));
         }
     }
-    pc::<QueryFn>(this, PC_BEGIN_QUERY)(this, heap, ty, index);
+    let (p, beg_q) = pc_call::<QueryFn>(this, PC_BEGIN_QUERY);
+    beg_q(p, heap, ty, index);
 }
 
 /// command list #29 EndQuery(heap, type, index) (PC #53)
@@ -3815,7 +3969,8 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
             return;
         }
     }
-    pc::<QueryFn>(this, PC_END_QUERY)(this, heap, ty, index);
+    let (p, end_q) = pc_call::<QueryFn>(this, PC_END_QUERY);
+    end_q(p, heap, ty, index);
 }
 
 /// command list #30 ResolveQueryData(heap, type, first, count, destination, offset) (PC #54):
@@ -3825,7 +3980,8 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
 pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, first: u32, count: u32, dest: usize, offset: u64) {
     let pc_offset = offset.saturating_add(real::buffer_delta(dest));
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
-    pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);
+    let (p, res_q) = pc_call::<F>(this, PC_RESOLVE_QUERY_DATA);
+    res_q(p, heap, ty, first, count, real::unwrap_proxy_usize(dest), pc_offset);
     if !is_occlusion(ty) {
         return;
     }
@@ -3845,7 +4001,8 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
         .collect();
     let modes = vec![D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; params.len()];
     type W = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
-    pc::<W>(this, PC_WRITE_BUFFER_IMMEDIATE)(this, params.len() as u32, params.as_ptr(), modes.as_ptr());
+    let (p, wbi) = pc_call::<W>(this, PC_WRITE_BUFFER_IMMEDIATE);
+    wbi(p, params.len() as u32, params.as_ptr(), modes.as_ptr());
 }
 
 #[cfg(test)]
@@ -5247,7 +5404,7 @@ mod tests {
 
             on_release(dl_ptr as usize);
             on_release(cl_ptr as usize);
-            SYNC_GRAPH.lock().unwrap().as_mut().map(|gr| gr.cells.remove(&va));
+            let _removed = SYNC_GRAPH.lock().unwrap().as_mut().and_then(|gr| gr.cells.remove(&va));
         }
     }
 
@@ -5338,10 +5495,12 @@ mod tests {
             on_release(dl_ptr as usize);
             on_release(cl1_ptr as usize);
             on_release(cl2_ptr as usize);
-            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
-                gr.cells.remove(&va_a);
-                gr.cells.remove(&va_b);
-            }
+            let _removed: Vec<_> = SYNC_GRAPH
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|gr| [va_a, va_b].into_iter().filter_map(|v| gr.cells.remove(&v)).collect())
+                .unwrap_or_default();
         }
     }
 
@@ -5415,19 +5574,20 @@ mod tests {
                     ..Default::default()
                 },
             );
+            let mut defer_drop = Vec::new();
             assert!(
-                !would_signal_close_cycle(&mut g, 0xD001, 0x2000, 10),
+                !would_signal_close_cycle(&mut g, 0xD001, 0x2000, 10, &mut defer_drop),
                 "back-to-back handshake (wait_seq=3 > sig_seq=2) must NOT be treated as a cycle"
             );
             // Now invert q0's order: q0 waited on B at seq=1 BEFORE signaling A at seq=2 -> TRUE cycle!
             g.cells.get_mut(&0x2000).unwrap().armed_waits[0].wait_seq = 1;
             assert!(
-                would_signal_close_cycle(&mut g, 0xD001, 0x2000, 10),
+                would_signal_close_cycle(&mut g, 0xD001, 0x2000, 10, &mut defer_drop),
                 "2-queue cycle (wait_seq=1 < sig_seq=2) MUST be detected at Signal time"
             );
             // k = 1 self-deadlock: q0 signaling B when q0 itself is waiting on B.
             assert!(
-                would_signal_close_cycle(&mut g, 0xC001, 0x2000, 10),
+                would_signal_close_cycle(&mut g, 0xC001, 0x2000, 10, &mut defer_drop),
                 "same-queue self-deadlock MUST be detected at Signal time"
             );
 
@@ -5496,14 +5656,15 @@ mod tests {
                     ..Default::default()
                 },
             );
+            let mut defer_drop3 = Vec::new();
             assert!(
-                would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d),
+                would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d, &mut defer_drop3),
                 "3-queue transitive cycle Direct -> C1 -> C2 -> Direct MUST be detected at Signal time"
             );
             // If C2 waited on D AFTER signaling C2_out (wait_seq=3 > sig_seq=2), NOT a cycle.
             g3.cells.get_mut(&0x3000).unwrap().armed_waits[0].wait_seq = 3;
             assert!(
-                !would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d),
+                !would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d, &mut defer_drop3),
                 "pipelined 3-queue chain with wait_seq > sig_seq must NOT be treated as a cycle"
             );
         }
@@ -5628,10 +5789,12 @@ mod tests {
             for p in [l0_ptr, l1_ptr, l2_ptr, l3_ptr, l4_ptr, l5_ptr] {
                 on_release(p as usize);
             }
-            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
-                gr.cells.remove(&va_rot);
-                gr.cells.remove(&va_nm);
-            }
+            let _removed: Vec<_> = SYNC_GRAPH
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|gr| [va_rot, va_nm].into_iter().filter_map(|v| gr.cells.remove(&v)).collect())
+                .unwrap_or_default();
         }
     }
 
@@ -5711,6 +5874,7 @@ mod tests {
                 }
             }
             let dev = dev.unwrap();
+            real::adopt(dev.as_raw(), real::Kind::Device);
             let q_comp: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let q_dir: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let a_comp: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
@@ -5829,11 +5993,12 @@ mod tests {
                 std::mem::transmute(*(*(wrap_c as *const *const usize)).add(2));
             assert_eq!(rel_fn(wrap_c), 0);
             on_release(pc_d0 as usize);
-            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
-                gr.cells.remove(&va_a);
-                gr.cells.remove(&va_b);
-                gr.cells.remove(&va_c);
-            }
+            let _removed: Vec<_> = SYNC_GRAPH
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|gr| [va_a, va_b, va_c].into_iter().filter_map(|v| gr.cells.remove(&v)).collect())
+                .unwrap_or_default();
         }
     }
 }
