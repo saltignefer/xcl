@@ -27,8 +27,16 @@ cargo test -p xcl --lib <filter>                           # one area while iter
 
 - GPU tests print `SKIPPED <test>: <reason>` when the adapter cannot run them and still pass. Report
   skips; do not count them as coverage.
-- On macOS / Linux the crate does not build or run. Do not claim it does: say "not built / not tested"
-  in the PR.
+- On macOS / Linux the crate does not build or run natively without a Windows cross-toolchain. On Apple Silicon macOS (fork `saltignefer/xcl`), cross-compile and verify against CrossOver + `vkd3d-proton 3.1` + `saltignefer/kosmickrisp` using `scripts/preflight_macos.py` (see `.agents/skills/xcl-macos-verify/SKILL.md` and `.agents/skills/xcl-poteto-workflow/SKILL.md`).
+
+### Rule -> Enforcer (macOS / fork workflow)
+
+| Rule | Enforcer |
+|---|---|
+| Clean fork author (`saltis` noreply), no local paths or game dumps | `python3 scripts/preflight_macos.py --check-hygiene` |
+| Branch fresh against `origin/main` (<=25 commits behind) | `python3 scripts/preflight_macos.py --check-hygiene` |
+| No new `#[ignore]` in `crates/`; `SKIPPED` counted separately from `ok` | `python3 scripts/preflight_macos.py --suite` |
+| No speculative hardware claims without real Metal/vkd3d verification | `.agents/skills/xcl-macos-verify/SKILL.md` |
 - Editing files through PowerShell `Get-Content` / `Set-Content` corrupts UTF-8: use your file tools.
 - Some steps (DXC compiles of many shaders, whole-pack runs) take many minutes: run them on small
   samples first.
