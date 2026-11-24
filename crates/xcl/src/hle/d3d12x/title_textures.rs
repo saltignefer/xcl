@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
@@ -297,10 +297,7 @@ fn adjust_pending(delta: isize) {
 
 unsafe fn clone_resources(ptrs: &[usize]) -> Vec<ID3D12Resource> {
     ptrs.iter()
-        .filter_map(|&raw| {
-            let p = raw as *mut c_void;
-            ID3D12Resource::from_raw_borrowed(&p).map(|r| r.clone())
-        })
+        .filter_map(|&raw| super::real::try_clone_resource(raw as *mut c_void))
         .collect()
 }
 
@@ -746,11 +743,20 @@ unsafe fn refresh_once(queue: *mut c_void) {
             super::vram::before_execute(q);
         });
     }
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    let unwatched_committed = u.has_unwatched_committed() && TEXTURES_LEN.load(Ordering::Relaxed) > 0;
+    if unwatched_committed {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("title textures: coherent UMA windows lack write-watch under Wine; using content-hash change detection for textures placed there");
+        }
+    }
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && !unwatched_committed {
         return;
     }
-    // textures made since the last submit and those with a written page; a reference each
-    // while they are uploaded
+    // textures made since the last submit, those with a written page, and textures residing in
+    // non-write-watched coherent windows (checked by content hash in `upload_all`); a strong
+    // reference is acquired via `try_clone_resource` so a concurrent final `ComProxy::Release`
+    // can never be resurrected from refcount 0.
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
@@ -763,6 +769,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.gpu_written {
                     return false;
                 }
+                if unwatched_committed && !u.is_write_watched(e.src) {
+                    return true;
+                }
                 let i = dirty.partition_point(|&p| p + page as usize <= e.src);
                 dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
             })
@@ -772,7 +781,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                super::real::try_clone_resource(p).map(|r| (r, (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });

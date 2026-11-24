@@ -276,81 +276,33 @@ fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
     p as usize
 }
 
-/// Thunk for a vtable slot on an adopted COM object whose runtime (`vkd3d-proton`) asserts
-/// `iface->lpVtbl == &d3d12_*_vtbl` on `this`. Temporarily restores `[this] = orig_vt` across
-/// the call to `original` and re-applies `ext` on return. Supports both MSVC C++ ABI (`this`
-/// in `rcx`) and C ABI struct returns (hidden buffer in `rcx`, `this` in `rdx`), forwards up
-/// to 4 stack arguments, and preserves `rax` and all `xmm` registers.
-pub fn make_unadopt_self(original: usize, ext: usize, orig_vt: usize) -> usize {
-    let mut c: Vec<u8> = Vec::with_capacity(144);
-    // Entry rsp = 16k + 8. Three pushes -> 16k - 16 (aligned). sub rsp, 0x40 -> 16k - 0x50 (aligned).
-    // Caller's 5th..8th args live at [rsp + 0x58 + 0x28 ..] = [rsp + 0x80 ..].
-    c.extend_from_slice(&[0x53, 0x56, 0x57]); // push rbx; push rsi; push rdi
-    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 0x40
-    for k in 0..4u32 {
-        c.extend_from_slice(&[0x48, 0x8B, 0x84, 0x24]); // mov rax, [rsp + 0x80 + 8*k]
-        c.extend_from_slice(&(0x80u32 + 8 * k).to_le_bytes());
-        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, (0x20 + 8 * k) as u8]); // mov [rsp + 0x20 + 8*k], rax
-    }
-    c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, ext
-    c.extend_from_slice(&(ext as u64).to_le_bytes());
-    c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, orig_vt
-    c.extend_from_slice(&(orig_vt as u64).to_le_bytes());
-
-    // Check rcx first (fast path: normal COM method call, rdx is never dereferenced)
-    c.extend_from_slice(&[0x48, 0x89, 0xCB]); // mov rbx, rcx
-    c.extend_from_slice(&[0x48, 0x81, 0xFB, 0x00, 0x00, 0x01, 0x00]); // cmp rbx, 0x10000
-    c.extend_from_slice(&[0x72, 0x00]); // jb check_rdx
-    let jb_check_rdx = c.len() - 1;
-    c.extend_from_slice(&[0x48, 0x39, 0x33]); // cmp [rbx], rsi
-    c.extend_from_slice(&[0x74, 0x00]); // je do_swap
-    let je_do_swap = c.len() - 1;
-
-    // check_rdx: C-ABI struct return (hidden out buffer in rcx, `this` in rdx)
-    let check_rdx = c.len();
-    c.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx
-    c.extend_from_slice(&[0x48, 0x81, 0xFB, 0x00, 0x00, 0x01, 0x00]); // cmp rbx, 0x10000
-    c.extend_from_slice(&[0x72, 0x00]); // jb no_swap
-    let jb_no_swap = c.len() - 1;
-    c.extend_from_slice(&[0x48, 0x39, 0x33]); // cmp [rbx], rsi
-    c.extend_from_slice(&[0x75, 0x00]); // jne no_swap
-    let jne_no_swap = c.len() - 1;
-
-    // do_swap:
-    let do_swap = c.len();
-    c.extend_from_slice(&[0x48, 0x89, 0x3B]); // mov [rbx], rdi
-    c.extend_from_slice(&[0xEB, 0x00]); // jmp do_call
-    let jmp_do_call = c.len() - 1;
-
-    // no_swap:
-    let no_swap = c.len();
-    c.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx
-
-    // do_call:
-    let do_call = c.len();
-    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, original
-    c.extend_from_slice(&(original as u64).to_le_bytes());
-    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    c.extend_from_slice(&[0x48, 0x85, 0xDB]); // test rbx, rbx
-    c.extend_from_slice(&[0x74, 0x03]); // jz +3 (skip `mov [rbx], rsi`)
-    c.extend_from_slice(&[0x48, 0x89, 0x33]); // mov [rbx], rsi
-    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp, 0x40
-    c.extend_from_slice(&[0x5F, 0x5E, 0x5B, 0xC3]); // pop rdi; pop rsi; pop rbx; ret
-
-    c[jb_check_rdx] = (check_rdx - (jb_check_rdx + 1)) as u8;
-    c[je_do_swap] = (do_swap - (je_do_swap + 1)) as u8;
-    c[jb_no_swap] = (no_swap - (jb_no_swap + 1)) as u8;
-    c[jne_no_swap] = (no_swap - (jne_no_swap + 1)) as u8;
-    c[jmp_do_call] = (do_call - (jmp_do_call + 1)) as u8;
+/// Pure-leaf tail-jump thunk for non-overridden slots of a `ComProxy` vtable.
+///
+/// Replaces `rcx` (`ComProxy*`) with `[rcx + 8]` (the wrapped native PC COM pointer `pc`),
+/// loads its native vtable `[rcx]`, and tail-jumps directly to `[rax + slot * 8]`.
+/// Because it never touches `rsp` or non-volatile registers, it requires no Win64 SEH unwind
+/// metadata and forwards arbitrary register, XMM, and stack arguments unchanged.
+pub fn make_proxy_forward(slot: usize) -> usize {
+    let mut c = [0u8; 13];
+    // mov rcx, [rcx + 8]
+    c[0..4].copy_from_slice(&[0x48, 0x8B, 0x49, 0x08]);
+    // mov rax, [rcx]
+    c[4..7].copy_from_slice(&[0x48, 0x8B, 0x01]);
+    // jmp qword ptr [rax + disp32]
+    c[7..9].copy_from_slice(&[0xFF, 0xA0]);
+    c[9..13].copy_from_slice(&((slot * 8) as u32).to_le_bytes());
 
     let p = stubs::alloc_code(c.len());
     unsafe {
         std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
+        let ok = windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
             p as *const _,
             c.len(),
         );
+        if ok == 0 {
+            crate::xlog_warn!("D3D12.X: FlushInstructionCache failed for proxy thunk slot #{slot}");
+        }
     }
     p as usize
 }
@@ -419,36 +371,21 @@ mod tests {
         assert_eq!(info.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
-    extern "system" fn check_rcx_vtbl(this: *mut usize, a: u64, b: u64, c: u64, d: u64, f: f64) -> u64 {
-        let seen = unsafe { *this };
-        seen as u64 + a + 10 * b + 100 * c + 1000 * d + (f * 10000.0) as u64
-    }
-
-    extern "system" fn check_rdx_vtbl(out: *mut u64, this: *mut usize) -> *mut u64 {
-        unsafe { *out = *this as u64 };
-        out
+    extern "system" fn check_proxy_target(this: *mut usize, a: u64, b: u64, c: u64, d: u64, e: u64, f: f64) -> u64 {
+        let tag = unsafe { *this.add(1) };
+        tag as u64 + a + 10 * b + 100 * c + 1000 * d + 10000 * e + (f * 100000.0) as u64
     }
 
     #[test]
-    fn unadopt_self_restores_orig_vtable_for_call_and_reapplies_ext() {
-        let orig_vt = 0x1111_2222_3333_4444usize;
-        let ext_vt = 0x5555_6666_7777_8888usize;
-        let mut obj = ext_vt;
+    fn proxy_forward_swaps_this_and_tail_jumps_with_all_args() {
+        let mut pc_vt = [0usize; 16];
+        pc_vt[13] = check_proxy_target as usize;
+        let pc_obj = [pc_vt.as_ptr() as usize, 7_000_000usize];
+        let proxy_vt = [make_proxy_forward(13)];
+        let proxy = [proxy_vt.as_ptr() as usize, pc_obj.as_ptr() as usize];
 
-        // MSVC C++ ABI: `this` in rcx, stack arg + float arg forwarded intact
-        let thunk_rcx = make_unadopt_self(check_rcx_vtbl as usize, ext_vt, orig_vt);
-        let f: extern "system" fn(*mut usize, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(thunk_rcx) };
-        let got = f(&mut obj, 1, 2, 3, 4, 5.0);
-        assert_eq!(got, orig_vt as u64 + 54321);
-        assert_eq!(obj, ext_vt, "extended vtable restored after return");
-
-        // C ABI struct return: hidden output buffer in rcx, `this` in rdx
-        let thunk_rdx = make_unadopt_self(check_rdx_vtbl as usize, ext_vt, orig_vt);
-        let g: extern "system" fn(*mut u64, *mut usize) -> *mut u64 = unsafe { std::mem::transmute(thunk_rdx) };
-        let mut out = 0u64;
-        let ret = g(&mut out, &mut obj);
-        assert_eq!(ret, &mut out as *mut u64);
-        assert_eq!(out, orig_vt as u64, "callee observed native vtable");
-        assert_eq!(obj, ext_vt, "extended vtable restored after C-ABI return");
+        let f: extern "system" fn(*const usize, u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(proxy_vt[0]) };
+        let got = f(proxy.as_ptr(), 1, 2, 3, 4, 5, 6.0);
+        assert_eq!(got, 7_654_321);
     }
 }

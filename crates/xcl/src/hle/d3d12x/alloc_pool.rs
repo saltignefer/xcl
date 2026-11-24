@@ -211,11 +211,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             let mut dev: Option<ID3D12Device> = None;
             this.GetDevice(&mut dev).ok()?;
             let made: ID3D12CommandAllocator = dev?.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).ok()?;
-            let raw = made.into_raw();
-            // (made through the title's device it is adopted already)
-            if !super::real::is_adopted(raw) {
-                super::real::adopt(raw, super::real::Kind::CommandAllocator);
-            }
+            let raw = super::real::adopt_or_wrap(made.into_raw(), super::real::Kind::CommandAllocator);
             s.made += 1;
             raw as usize
         }
@@ -247,12 +243,10 @@ mod tests {
             let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
                 return crate::gpu::recomp::runner::skip_test("no GPU");
             };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let a = alloc.as_raw();
-            if !super::super::real::is_adopted(a) {
-                super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
-            }
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
             let l = list.as_raw();
             created_on(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);

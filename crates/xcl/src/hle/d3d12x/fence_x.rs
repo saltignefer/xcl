@@ -25,8 +25,12 @@ struct Fence {
     waited: u64,
 }
 
-/// (fences are never freed: XCL holds a reference to each)
+/// Tracked fences (pinned on native Windows; evicted on final release under Wine `ComProxy`).
 static FENCES: Mutex<Option<HashMap<usize, Fence>>> = Mutex::new(None);
+/// Serializes `refresh()` read+publish passes so concurrent event/CPU-signal refreshes cannot
+/// publish a stale value out of order, while preserving legal D3D12 fence rewinds (`Signal(0)`)
+/// and keeping final `ID3D12Fence` drops outside both `FENCES` and `REFRESH_LOCK`.
+static REFRESH_LOCK: Mutex<()> = Mutex::new(());
 
 /// the event a completion sets (auto-reset); the first use starts the thread that follows it
 fn event() -> usize {
@@ -50,14 +54,26 @@ unsafe fn borrowed<R>(fence: usize, f: impl FnOnce(&ID3D12Fence) -> R) -> Option
 }
 
 fn refresh() {
-    let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
-    for (&p, f) in g.iter().flatten() {
-        if let Some(c) = f.cell {
-            if let Some(v) = unsafe { borrowed(p, |f| f.GetCompletedValue()) } {
-                c.0.store(v, Ordering::Release);
-            }
+    let live: Vec<(ID3D12Fence, &'static Cell)> = {
+        let _serial = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cloned: Vec<(ID3D12Fence, &'static Cell)> = {
+            let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .flatten()
+                .filter_map(|(&p, f)| {
+                    let c = f.cell?;
+                    let owned = unsafe { super::real::try_clone_fence(p as *mut c_void) }?;
+                    Some((owned, c))
+                })
+                .collect()
+        };
+        for (fence, c) in &cloned {
+            let v = unsafe { fence.GetCompletedValue() };
+            c.0.store(v, Ordering::Release);
         }
-    }
+        cloned
+    };
+    drop(live);
 }
 
 unsafe fn arm(fence: usize, value: u64) {
@@ -84,6 +100,13 @@ pub(super) fn note_queue_wait(fence: usize, value: u64) {
     let mut g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
     let f = g.get_or_insert_with(HashMap::new).entry(fence).or_default();
     f.waited = f.waited.max(value);
+}
+
+/// Remove a released fence from tracking before it is destroyed so `refresh` never dereferences it.
+pub(super) fn forget(fence: usize) {
+    if let Some(m) = FENCES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.remove(&fence);
+    }
 }
 
 /// The CPU signalled `fence`.

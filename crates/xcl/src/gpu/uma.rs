@@ -43,6 +43,9 @@ enum WindowKind {
 pub struct Uma {
     base: usize,
     kinds: [WindowKind; MAX_WINDOWS],
+    /// Whether committed coherent windows were allocated with `MEM_WRITE_WATCH`.
+    /// `true` on native Windows; `false` under Wine so Metal `newBufferWithBytesNoCopy` gets RW pages.
+    committed_watched: bool,
     /// VirtualAlloc base pointers owned by this Uma (freed on Drop)
     win_allocs: Vec<usize>,
     inner: Mutex<Inner>,
@@ -179,7 +182,12 @@ impl Uma {
                 continue;
             }
             let c_base = base + (MAX_WINDOWS - 1) * WINDOW;
-            let cp = unsafe { VirtualAlloc(c_base as *const std::ffi::c_void, committed, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            // Under Wine without kernel write-watch (e.g. macOS/Rosetta), MEM_WRITE_WATCH marks
+            // untouched pages PROT_READ and splits them into 4 KiB mprotect regions on fault;
+            // Metal's newBufferWithBytesNoCopy either rejects split regions or maps PROT_READ
+            // pages read-only on the GPU, silently dropping GPU writes into the coherent window.
+            let c_watch = if crate::util::under_wine() { 0 } else { MEM_WRITE_WATCH };
+            let cp = unsafe { VirtualAlloc(c_base as *const std::ffi::c_void, committed, MEM_RESERVE | MEM_COMMIT | c_watch, PAGE_READWRITE) };
             if cp as usize != c_base {
                 if !cp.is_null() {
                     unsafe { VirtualFree(cp, 0, MEM_RELEASE) };
@@ -194,6 +202,7 @@ impl Uma {
             let u = Uma {
                 base,
                 kinds: [WindowKind::Sparse, WindowKind::Sparse, WindowKind::Sparse, WindowKind::Committed(committed)],
+                committed_watched: c_watch != 0,
                 win_allocs: vec![base, c_base],
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
@@ -381,8 +390,11 @@ impl Uma {
             let mut got = Vec::new();
             for k in 0..windows {
                 let want = base + k * WINDOW;
-                // write-watched: textures the title keeps here are uploaded again after CPU writes
-                let p = unsafe { VirtualAlloc(want as *const std::ffi::c_void, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+                // write-watched on native Windows (textures the title keeps here are uploaded again
+                // after CPU writes); omitted under Wine so OpenExistingHeapFromAddress gets a
+                // clean single RW mapping instead of PROT_READ write-watch pages.
+                let watch = if crate::util::under_wine() { 0 } else { MEM_WRITE_WATCH };
+                let p = unsafe { VirtualAlloc(want as *const std::ffi::c_void, size, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE) };
                 if p.is_null() {
                     break;
                 }
@@ -400,6 +412,7 @@ impl Uma {
                 return Some(Uma {
                     base,
                     kinds,
+                    committed_watched: !crate::util::under_wine(),
                     win_allocs,
                     inner: Mutex::new(inner),
                     sparse_free: Mutex::new(Default::default()),
@@ -445,7 +458,7 @@ impl Uma {
 
     /// Underlying write-watched `VirtualAlloc` regions `(base, size)` for `GetWriteWatch`:
     /// contiguous sparse windows belong to a single reservation, while each committed window
-    /// is its own allocation.
+    /// is included only when it was allocated with `MEM_WRITE_WATCH`.
     pub fn watch_regions(&self) -> Vec<(usize, usize)> {
         let mut out: Vec<(usize, usize)> = Vec::with_capacity(MAX_WINDOWS);
         let mut k = 0;
@@ -453,7 +466,9 @@ impl Uma {
             match self.kinds[k] {
                 WindowKind::None => k += 1,
                 WindowKind::Committed(s) => {
-                    out.push((self.base + k * WINDOW, s));
+                    if self.committed_watched {
+                        out.push((self.base + k * WINDOW, s));
+                    }
                     k += 1;
                 }
                 WindowKind::Sparse => {
@@ -468,6 +483,26 @@ impl Uma {
             }
         }
         out
+    }
+
+    /// Whether this UMA has committed coherent windows without `MEM_WRITE_WATCH` (Wine).
+    pub fn has_unwatched_committed(&self) -> bool {
+        !self.committed_watched && self.windows() > 0
+    }
+
+    /// Whether `addr` lies in a write-watched UMA window (or outside committed unwatched windows).
+    pub fn is_write_watched(&self, addr: usize) -> bool {
+        if addr < self.base {
+            return true;
+        }
+        let k = (addr - self.base) / WINDOW;
+        if k >= MAX_WINDOWS {
+            return true;
+        }
+        match self.kinds[k] {
+            WindowKind::Committed(_) => self.committed_watched,
+            _ => true,
+        }
     }
 
     pub fn window_of(&self, p: usize) -> Option<usize> {

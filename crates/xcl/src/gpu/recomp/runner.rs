@@ -72,6 +72,19 @@ unsafe impl Send for Gpu {}
 
 static GPU: Mutex<Option<Result<Gpu, String>>> = Mutex::new(None);
 
+/// Obtain `&mut Gpu` from the locked global slot and, under Wine, ensure `gpu.queue` is
+/// adopted if `real::init()` adopted the singleton `ID3D12Device` after `runner::init()`
+/// created `gpu.queue`. Native Windows stays untouched (`under_wine() == false`).
+fn ensure_gpu<'a>(g: &'a mut Option<Result<Gpu, String>>) -> Result<&'a mut Gpu, String> {
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    if crate::util::under_wine() {
+        unsafe {
+            crate::hle::d3d12x::real::sync_queue_with_device(gpu.dev.as_raw(), gpu.queue.as_raw());
+        }
+    }
+    Ok(gpu)
+}
+
 fn e(x: windows::core::Error) -> String {
     format!("{x}")
 }
@@ -461,7 +474,7 @@ pub fn run_with_statics(
     statics: &[super::pso::StaticSampler],
 ) -> Result<KernelResult, String> {
     let mut g = GPU.lock().unwrap();
-    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let gpu = ensure_gpu(&mut g)?;
     let rs: ID3D12RootSignature = if statics.is_empty() { gpu.rs.clone() } else { super::pso::abi_root_signature_with(&gpu.dev, false, statics)? };
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
@@ -702,7 +715,7 @@ fn draw_gs_views(
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
     let mut g = GPU.lock().unwrap();
-    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let gpu = ensure_gpu(&mut g)?;
     unsafe {
         let dev = &gpu.dev;
         let rs = root_signature(dev, true)?;
@@ -1078,7 +1091,7 @@ pub fn mesh_draw_split(
     clear: [f32; 4],
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
     let mut g = GPU.lock().unwrap();
-    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let gpu = ensure_gpu(&mut g)?;
     unsafe {
         let dev = &gpu.dev;
         let cpso: ID3D12PipelineState = dev
@@ -1241,7 +1254,7 @@ pub fn run_in_arena(dxil: &[u8], state: &KernelState, arena: &crate::gpu::uma::U
 
 fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<KernelResult, String> {
     let mut g = GPU.lock().unwrap();
-    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let gpu = ensure_gpu(&mut g)?;
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
@@ -1348,7 +1361,7 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
 /// u0 = user SGPRs, u2 = flat memory. Returns the memory afterwards.
 pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
     let mut g = GPU.lock().unwrap();
-    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let gpu = ensure_gpu(&mut g)?;
     let pso: ID3D12PipelineState = unsafe {
         gpu.dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: transmute_copy(&gpu.rs),
@@ -1365,7 +1378,7 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
 /// buffer, upload, submission or CPU wait time in them. For benchmarks.
 pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32], reps: usize) -> Result<Vec<f64>, String> {
     let mut g = GPU.lock().unwrap();
-    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let gpu = ensure_gpu(&mut g)?;
     let pso: ID3D12PipelineState = unsafe {
         gpu.dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: transmute_copy(&gpu.rs),

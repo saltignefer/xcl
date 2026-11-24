@@ -3434,10 +3434,10 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
     // Translate + DXC-compile RDNA2 compute shader (4 windows, 32-bit descriptor table with hi = 0)
     let p = prog(&[
-        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0)], None), // s[0:1] -> Window 3 root arg table
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)], None), // s[0:1] -> Window 3 root arg table
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None), // s5 = 0 (32-bit descriptor table pointer)
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32), ("SOFFSET", 125)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
         ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 20), ("VSRC1", 1)], None),
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
@@ -3462,6 +3462,23 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        // Bind shader-visible descriptor heaps as required by abi_root_signature's directly-indexed flags.
+        let view_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .unwrap();
+        let samp_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .unwrap();
 
         // User SGPRs: s[0:1] = 64-bit arg_table (Window 3), s4 = 32-bit descriptor table offset in Window 0
         let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
@@ -3477,6 +3494,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
                 alloc.Reset().unwrap();
                 list.Reset(&alloc, Some(&pso)).unwrap();
             }
+            list.SetDescriptorHeaps(&[Some(view_heap.clone()), Some(samp_heap.clone())]);
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
             list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());

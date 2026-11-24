@@ -22,7 +22,9 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
 const TICK: Duration = Duration::from_millis(4);
 
 struct Batch {
-    dead: Vec<usize>,
+    /// `(resource_ptr, is_native)`: `is_native = true` releases via native vtable slot 2
+    /// (`ComProxy` path under Wine); `false` releases via `orig_fn(ptr, 2)` (adopted path).
+    dead: Vec<(usize, bool)>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -31,7 +33,7 @@ struct Batch {
 struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
-    open: Vec<usize>,
+    open: Vec<(usize, bool)>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -46,7 +48,7 @@ impl Held {
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<(usize, bool)> {
         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -62,7 +64,7 @@ impl Held {
                     self.fences.insert(key, (f, 0));
                 }
                 let (fence, value) = self.fences.get_mut(&key).unwrap();
-                let raw_fence = super::real::unwrap_fence(fence.as_raw());
+                let raw_fence = super::real::unwrap_proxy(fence.as_raw());
                 let native_fence = ID3D12Fence::from_raw_borrowed(&raw_fence).unwrap_or(fence);
                 if q.Signal(native_fence, *value + 1).is_err() {
                     ok = false;
@@ -102,7 +104,16 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
 /// before. Otherwise the thread here lets it go.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+    hold_entry(res, false);
+}
+
+/// Hold a native (unwrapped) PC resource pointer whose owning `ComProxy` has already been freed.
+pub unsafe fn hold_native(pc_res: usize) {
+    hold_entry(pc_res, true);
+}
+
+unsafe fn hold_entry(res: usize, is_native: bool) {
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push((res, is_native));
     let start = Instant::now();
     drain_known(true);
     while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
@@ -144,16 +155,14 @@ pub unsafe fn drain_known(seal_now: bool) {
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
-    for res in gone {
+    for (res, is_native) in gone {
         let ptr = res as *mut c_void;
-        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(ptr, 2));
-        let g = super::real::UnadoptGuard::new(ptr);
-        let n = f(ptr);
-        if n == 0 {
-            if let Some(g) = g {
-                g.forget();
-            }
-        }
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = if is_native {
+            std::mem::transmute(*(*(ptr as *const *const usize)).add(2))
+        } else {
+            std::mem::transmute(super::real::orig_fn(ptr, 2))
+        };
+        f(ptr);
     }
 }
 
@@ -189,7 +198,7 @@ mod tests {
             let raw = res.unwrap().into_raw() as usize;
 
             let mut held = Held::default();
-            held.open.push(raw);
+            held.open.push((raw, true));
             let queues = [queue.clone()];
             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
@@ -203,7 +212,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 gone = held.drain(&queues, false);
             }
-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
+            assert_eq!(gone, vec![(raw, true)], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
@@ -213,8 +222,8 @@ mod tests {
     #[test]
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
-        held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        held.open.push((0x1000, false));
+        assert_eq!(unsafe { held.drain(&[], false) }, vec![(0x1000, false)]);
         assert!(held.is_empty());
     }
 }
