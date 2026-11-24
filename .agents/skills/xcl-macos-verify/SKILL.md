@@ -19,6 +19,8 @@ Completion criterion: `hygiene ok` (clean `saltis` noreply identity, no forbidde
 
 ## 2. Red-to-green targeted check
 
+Before editing an existing workaround in `real.rs`, `sparse.rs`, `list_x.rs`, or `recomp/`, check why it exists (`git log -S <symbol> -p -n 3`) so you do not re-introduce a retail-game regression.
+
 Build and run the exact failing test(s) first:
 
 ```sh
@@ -26,9 +28,10 @@ python3 scripts/preflight_macos.py --build --no-cache \
   --test gpu::recomp::tests::<test_name>
 ```
 
-When diagnosing a shader or Metal compiler failure:
+When diagnosing a shader, COM vtable, or Metal failure:
 - Dump generated MSL with `MESA_KK_DEBUG=msl` and `MESA_SHADER_CACHE_DISABLE=1 VKD3D_SHADER_CACHE_PATH=0`.
-- When two fixes sharing one premise fail the same gate, stop and write a 15-line standalone probe (`arch -x86_64` or plain D3D12) to test the premise directly before writing a third fix.
+- Inspect `d3d12core.dll` directly (`strings` / `llvm-symbolizer`) instead of guessing which `iface->lpVtbl` assertions exist.
+- **Attack the premise:** when two fixes sharing one premise fail the same gate, stop. Write down the shared premise in one sentence and run a 15-line standalone probe (`arch -x86_64` or plain D3D12) to test that premise directly before writing a third fix.
 
 Completion criterion: target test reproduces red before the fix and passes green (`ok`, not `SKIPPED`) after.
 

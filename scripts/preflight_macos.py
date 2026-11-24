@@ -44,14 +44,23 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None, cwd: Path | None =
     return p.returncode, p.stdout
 
 
-def check_hygiene(base: str) -> list[str]:
+def check_hygiene(base: str, ci: bool = False) -> list[str]:
     errors: list[str] = []
 
-    # 1. Author identity check
-    _, name = run(["git", "config", "user.name"], cwd=ROOT)
-    _, email = run(["git", "config", "user.email"], cwd=ROOT)
-    if name.strip() != "saltis" or not email.strip().endswith("@users.noreply.github.com"):
-        errors.append(f"git identity must be saltis <*@users.noreply.github.com>, got: {name.strip()} <{email.strip()}>")
+    # 1. Author identity check (local git config locally; commit log in CI)
+    if ci:
+        rc, log_out = run(["git", "log", f"{base}..HEAD", "--format=%an <%ae>"], cwd=ROOT)
+        if rc == 0:
+            for line in log_out.splitlines():
+                if not line.strip():
+                    continue
+                if re.search(r"@(?:gmail|proton|icloud|outlook|hotmail|yahoo)\.", line, re.I):
+                    errors.append(f"personal email in commit history: {line}")
+    else:
+        _, name = run(["git", "config", "user.name"], cwd=ROOT)
+        _, email = run(["git", "config", "user.email"], cwd=ROOT)
+        if name.strip() != "saltis" or not email.strip().endswith("@users.noreply.github.com"):
+            errors.append(f"git identity must be saltis <*@users.noreply.github.com>, got: {name.strip()} <{email.strip()}>")
 
     # 2. Base freshness check (prevents stale-base batch-merge failures)
     rc, behind_out = run(["git", "rev-list", "--count", f"HEAD..{base}"], cwd=ROOT)
@@ -60,13 +69,20 @@ def check_hygiene(base: str) -> list[str]:
         if behind > 25:
             errors.append(f"branch is {behind} commits behind {base}; rebase before opening a PR")
 
-    # 3. Changed files check: forbidden binary/game-data extensions + privacy patterns
+    # 3. Changed files check: forbidden binary/game-data extensions + privacy patterns + monolith contention
     rc, files_out = run(["git", "diff", "--name-only", base], cwd=ROOT)
     changed = [f for f in files_out.splitlines() if f.strip()] if rc == 0 else []
     _, untracked_out = run(["git", "ls-files", "--others", "--exclude-standard"], cwd=ROOT)
     changed += [f for f in untracked_out.splitlines() if f.strip()]
+    changed_set = sorted(set(changed))
 
-    for rel in sorted(set(changed)):
+    has_code = any(f.startswith("crates/") for f in changed_set)
+    if has_code:
+        for f in changed_set:
+            if f == "HANDOFF.md" or f.startswith("docs/specs/"):
+                errors.append(f"code change also edits monolith doc {f}; note doc updates in the PR body instead")
+
+    for rel in changed_set:
         p = ROOT / rel
         if p.suffix.lower() in FORBIDDEN_EXTS:
             errors.append(f"forbidden file extension in diff: {rel}")
@@ -257,6 +273,7 @@ def main() -> int:
     ap.add_argument("--tools-dir", type=Path, default=ROOT.parent / "tools", help="Directory with msvc-inc/winsdk-inc/dxc")
     ap.add_argument("--bottle", default="xcl-kk", help="CrossOver bottle name")
     ap.add_argument("--check-hygiene", action="store_true", help="Run git/privacy/game-data hygiene checks")
+    ap.add_argument("--ci", action="store_true", help="CI mode for --check-hygiene (audit commit log instead of local git config)")
     ap.add_argument("--build", action="store_true", help="Cross-compile xcl test binary")
     ap.add_argument("--suite", action="store_true", help="Run GPU test suite under CrossOver")
     ap.add_argument("--filter", default="::gpu_", help="Substring filter for --suite")
@@ -271,7 +288,7 @@ def main() -> int:
         args.build = True
 
     if args.check_hygiene:
-        errs = check_hygiene(args.base)
+        errs = check_hygiene(args.base, ci=args.ci)
         if errs:
             print("HYGIENE FAILED:", file=sys.stderr)
             for e in errs:

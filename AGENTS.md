@@ -33,10 +33,13 @@ cargo test -p xcl --lib <filter>                           # one area while iter
 
 | Rule | Enforcer |
 |---|---|
-| Clean fork author (`saltis` noreply), no local paths or game dumps | `python3 scripts/preflight_macos.py --check-hygiene` |
-| Branch fresh against `origin/main` (<=25 commits behind) | `python3 scripts/preflight_macos.py --check-hygiene` |
-| No new `#[ignore]` in `crates/`; `SKIPPED` counted separately from `ok` | `python3 scripts/preflight_macos.py --suite` |
+| Clean fork author (`saltis` noreply), no local paths, personal emails, or game dumps | `python3 scripts/preflight_macos.py --check-hygiene` + `.github/workflows/fork-hygiene.yml` |
+| Branch fresh against `origin/main` (<=25 commits behind) | `python3 scripts/preflight_macos.py --check-hygiene` + `.github/workflows/fork-hygiene.yml` |
+| No `HANDOFF.md` or `docs/specs/` edits bundled with `crates/` code PRs | `python3 scripts/preflight_macos.py --check-hygiene` + `.github/workflows/fork-hygiene.yml` |
+| No new `#[ignore]` in `crates/`; `SKIPPED` counted separately from `ok` | `python3 scripts/preflight_macos.py --suite` + `--check-hygiene` |
 | No speculative hardware claims without real Metal/vkd3d verification | `.agents/skills/xcl-macos-verify/SKILL.md` |
+
+Project skills in `.agents/skills/`: `xcl-macos-verify` (auto), `xcl-poteto-workflow`, `xcl-blast-radius`, `xcl-interrogate`, `gpu-benchmark`, `xcl-architect`, `show-me-your-work`, `repo-correct`, `pr-writing`.
 - Editing files through PowerShell `Get-Content` / `Set-Content` corrupts UTF-8: use your file tools.
 - Some steps (DXC compiles of many shaders, whole-pack runs) take many minutes: run them on small
   samples first.
